@@ -6,7 +6,7 @@ import os
 import textwrap
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import timedelta
 from functools import partial
@@ -123,10 +123,10 @@ class JobQ:
         exist_ok: bool = True,
     ) -> AsyncGenerator[T, None]:
         """Creates a new queue from a Service Bus."""
-        from .backend.servicebus import ServiceBusJobqBackend
+        from .backend.servicebus_rest import ServiceBusRestBackend
 
         assert fqns is not None
-        async with ServiceBusJobqBackend(
+        async with ServiceBusRestBackend(
             queue_name=name,
             fqns=fqns,
             credential=credential,
@@ -320,18 +320,51 @@ class JobQ:
             start_time = time.time()
             exc = None
             ret: Optional[CallbackReturnType] = None
+            lock_lost = False
             try:
                 if signature(command_callback).parameters.get("_job_id") is not None:
                     kwargs["_job_id"] = task.id
                 if signature(command_callback).parameters.get("_worker_id") is not None:
                     kwargs["_worker_id"] = worker_id
                 if _is_async_callable(command_callback):
-                    ret = await command_callback(**kwargs)  # type: ignore
+                    callback_task = asyncio.ensure_future(command_callback(**kwargs))  # type: ignore
+                    lock_lost_task = asyncio.ensure_future(envelope.lock_lost_event.wait())
+                    try:
+                        done, pending = await asyncio.wait(
+                            [callback_task, lock_lost_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except asyncio.CancelledError:
+                        # Outer task was cancelled (e.g. worker shutdown) —
+                        # propagate cancellation to the sub-tasks, then await
+                        # the callback so it can clean up (e.g. SIGTERM
+                        # subprocesses).  Whatever the callback raises
+                        # (WorkerCanceled, CancelledError, etc.) propagates.
+                        lock_lost_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await lock_lost_task
+                        callback_task.cancel()
+                        await callback_task
+                    if lock_lost_task in done:
+                        # Lock was lost — cancel the callback and walk away.
+                        callback_task.cancel()
+                        with suppress(asyncio.CancelledError, WorkerCanceled, Exception):
+                            await callback_task
+                        lock_lost = True
+                    else:
+                        lock_lost_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await lock_lost_task
+                        ret = callback_task.result()
+                        # avoid race condition where the two tasks finished almost at the same time
+                        lock_lost = envelope.lock_lost_event.is_set()
                 else:
                     LOG.warning(
                         "Callback does not seem to be async. This is problematic if you're using heartbeats and/or multiple workers."
                     )
                     ret = command_callback(**kwargs)  # type: ignore
+                    lock_lost = envelope.lock_lost_event.is_set()
+                # this value will be ignored when the lock was lost:
                 execution_was_succesful = True
             except WorkerCanceled:
                 await envelope.cancel_heartbeat()
@@ -349,11 +382,25 @@ class JobQ:
             except Exception as e:
                 exc = e  # this roundabout way makes mypy happy.
                 execution_was_succesful = False
+                lock_lost = envelope.lock_lost_event.is_set()
                 await envelope.cancel_heartbeat()
             else:
                 await envelope.cancel_heartbeat()
 
             duration = time.time() - start_time
+
+            if lock_lost:
+                LOG.warning(
+                    f"Lock lost for task {task.id} — abandoning without settlement "
+                    f"(another worker will handle it).",
+                    extra={
+                        "duration_s": duration,
+                        "task_id": task.id,
+                        "event": "task_lock_lost",
+                    },
+                )
+                return False
+
             if execution_was_succesful:
                 LOG.info(
                     f"Completed task {task.id} successfully.",
@@ -369,7 +416,7 @@ class JobQ:
                         await envelope.reply(Response(is_success=True, body=ret))
                     await envelope.delete(success=True)
                 except Exception as e:
-                    LOG.warning("Failed to delete message: %s", e)
+                    LOG.warning("Failed to delete message %s: %s", envelope.id, e)
                 return True
             else:
                 # get our caching log handler

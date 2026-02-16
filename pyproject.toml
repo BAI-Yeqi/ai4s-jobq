@@ -30,6 +30,7 @@ dependencies = [
   "cachetools",
   "azure-servicebus",
   "appdirs",
+  "tenacity",
 ]
 
 urls.repository = "https://github.com/microsoft/ai4s-jobq"
@@ -53,9 +54,6 @@ dev = [
 ]
 workforce = [
     "azure-ai-ml", "pydantic",
-]
-servicebus = [
-  "azure-servicebus"
 ]
 track = [
   "dash_bootstrap_components",
