@@ -1,8 +1,14 @@
 CHANGELOG
 =========
 
-3.3.1 (2026-03-20)
+3.2.0 (2026-03-20)
 ------------------
+
+Features:
+
+* Include ``azureml_workspace_name`` in Application Insights custom dimensions
+  even when ``AZUREML_RUN_ID`` is not set (e.g. AzureML batch jobs), so
+  Grafana dashboards can filter by workspace for all job types.
 
 Fixes:
 
