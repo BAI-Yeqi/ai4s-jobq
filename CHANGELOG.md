@@ -1,6 +1,33 @@
 CHANGELOG
 =========
 
+3.7.0 (unreleased)
+------------------
+
+Breaking changes:
+
+* **Rename ``Workforce.State.num_queued`` → ``num_pending``.**
+  The field now accurately reflects that it counts all non-running active jobs
+  (Queued, Preparing, Paused, Starting, Waiting), not just queued ones.
+  Consumers accessing ``.num_queued`` on ``State`` must update to ``.num_pending``.
+
+Features:
+
+* **Add ``DetailedState`` with per-status breakdowns.**
+  New ``DetailedState(State)`` subclass exposes ``num_paused``, ``num_queued``,
+  ``num_preparing``, ``num_starting``, and ``num_waiting`` fields.
+  Retrieve via ``Workforce.get_detailed_state()`` at no extra API cost.
+
+3.6.1 (2026-04-16)
+------------------
+
+Fixes:
+
+* **Suppress OTel exporter log spam after preemption.**
+  Set the ``azure.monitor.opentelemetry.exporter.export._base`` logger to
+  ``CRITICAL`` so that failed telemetry exports no longer flood user logs
+  with tracebacks when the AppInsights endpoint is unreachable.
+
 3.6.0 (2026-04-09)
 ------------------
 
