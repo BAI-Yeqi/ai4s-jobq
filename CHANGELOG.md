@@ -1,6 +1,28 @@
 CHANGELOG
 =========
 
+3.7.1 (2026-04-17)
+------------------
+
+Fixes:
+
+* **Fix Service Bus REST ``peek_messages()`` using AMQP SDK.**
+  The REST API ``peekonly=true`` parameter behaves inconsistently across
+  Service Bus namespace tiers — on some it returns 404, on others it
+  silently locks the message instead of peeking.  Replaced with the native
+  AMQP-based ``ServiceBusReceiver.peek_messages`` for true non-destructive
+  peek (no locks, no delivery-count increment).
+
+* **Retry transient 404 in ``peek_lock_message()``.**
+  After queue operations the Service Bus data-plane may briefly return 404.
+  ``peek_lock_message`` now retries up to 3 times with a 2 s back-off.
+
+Internal:
+
+* **Enable strict linting, type checking, and CI hardening.**
+  Added 25+ ruff rule groups, strict mypy configuration, split CI into
+  lint / test / docs jobs, added PR review workflow and CODEOWNERS.
+
 3.7.0 (2026-04-16)
 ------------------
 
