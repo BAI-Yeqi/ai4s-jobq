@@ -55,12 +55,26 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
+    TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.text import Text
 
 LOG = logging.getLogger(__name__)
+
+
+class _RateColumn(ProgressColumn):
+    """Show throughput as items/sec (blank until enough samples accrue)."""
+
+    def render(self, task) -> Text:
+        speed = task.finished_speed if task.finished else task.speed
+        if speed is None:
+            return Text("--/s", style="progress.data.speed")
+        return Text(f"{speed:.1f}/s", style="progress.data.speed")
+
 
 Status = Literal[
     "Cancel requested",
@@ -417,10 +431,16 @@ class Workforce:
         while True:
             token = self._credential.get_token("https://ml.azure.com/.default")
             headers = {"Authorization": f"Bearer {token.token}", "Content-Type": "application/json"}
-            response = self.session.post(
+            # Retry transient 5xx (nginx 503s are common during AML front-door
+            # load spikes), 429s, and connection-level errors (DNS failures,
+            # TCP resets, read timeouts). Exhausting retries raises so the
+            # caller can decide whether to fall back to a cached state.
+            response = self._request_with_retry(
+                "POST",
                 url,
-                json=dict(**payload, continuationToken=continuation_token),
                 headers=headers,
+                json=dict(**payload, continuationToken=continuation_token),
+                endpoint_label="list_jobs",
             )
 
             if response.status_code != 200:
@@ -578,20 +598,11 @@ class Workforce:
             return 0, 0
         succeeded = 0
         failed = 0
-        pbar: Progress | None = (
-            Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-            )
-            if progress
-            else None
-        )
+        base_desc = f"{desc} [{self._display_name}]"
+        pbar: Progress | None = self._make_progress() if progress else None
         pbar_cm = pbar if pbar is not None else nullcontext()
         with pbar_cm, ThreadPoolExecutor(max_workers=workers) as pool:
-            task_id = pbar.add_task(desc, total=len(items)) if pbar is not None else None
+            task_id = pbar.add_task(base_desc, total=len(items)) if pbar is not None else None
             # Map future -> input item so we can label failures; fn returns None.
             futures = {pool.submit(fn, item): item for item in items}
             for fut in as_completed(futures):
@@ -603,7 +614,11 @@ class Workforce:
                     failed += 1
                     LOG.warning("%s failed for %s: %s", desc, item_label(item), exc)
                 if pbar is not None and task_id is not None:
-                    pbar.advance(task_id)
+                    pbar.update(
+                        task_id,
+                        advance=1,
+                        description=self._desc_with_counts(base_desc, succeeded, failed),
+                    )
         return succeeded, failed
 
     def _progress_iter(
@@ -623,17 +638,44 @@ class Workforce:
         if not enabled:
             yield from items
             return
-        with Progress(
+        base_desc = f"{desc} [{self._display_name}]"
+        with self._make_progress() as pbar:
+            task_id = pbar.add_task(base_desc, total=total)
+            for done, item in enumerate(items, start=1):
+                yield item
+                pbar.update(
+                    task_id,
+                    advance=1,
+                    description=self._desc_with_counts(base_desc, done, 0),
+                )
+
+    @property
+    def _display_name(self) -> str:
+        """Short identifier used in progress bars / logs."""
+        return self._experiment_name
+
+    @staticmethod
+    def _desc_with_counts(base: str, ok: int, failed: int) -> str:
+        """Append live ✓/✗ counters to a progress description."""
+        if failed:
+            return f"{base}  [green]✓{ok}[/green] [red]✗{failed}[/red]"
+        return f"{base}  [green]✓{ok}[/green]"
+
+    @staticmethod
+    def _make_progress() -> Progress:
+        """Build a Progress with unified, information-dense columns.
+
+        Columns: description | bar | m/n | % | rate | elapsed | ETA.
+        """
+        return Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
+            TaskProgressColumn(),
+            _RateColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
-        ) as pbar:
-            task_id = pbar.add_task(desc, total=total)
-            for item in items:
-                yield item
-                pbar.advance(task_id)
+        )
 
     def hire(self, n: int, batch_size: int = 200, *, progress: bool = True) -> None:
         """Adds workers to the workforce.
@@ -699,6 +741,67 @@ class Workforce:
         )
         if failed:
             LOG.warning("%d/%d hires failed", failed, remaining)
+
+    def parallel_hire_in_batches(
+        self,
+        n: int,
+        batch_size: int = 512,
+        delay: float = 10.0,
+        *,
+        workers: int = 8,
+        progress: bool = True,
+    ) -> None:
+        """Hire ``n`` workers in batches, sleeping ``delay`` seconds between batches.
+
+        Wraps :meth:`parallel_hire` to cap the in-flight burst at
+        ``batch_size`` submissions. AzureML's container-registry and
+        MFE job-submission endpoints throttle aggressively when
+        thousands of ``create_or_update`` calls land back-to-back from
+        the same workspace; spacing batches with a short sleep avoids
+        that throttling without sacrificing intra-batch parallelism.
+
+        The first call still primes the code / environment upload (via
+        :meth:`parallel_hire` → :meth:`hire(1)`), so later batches reuse
+        the cached artifact in blob storage.
+
+        Args:
+            n: Total number of workers to hire. Non-positive values are a no-op.
+            batch_size: Maximum workers per batch (default 512).
+            delay: Seconds to sleep between batches (default 10.0). Skipped
+                after the final batch.
+            workers: Thread-pool size passed through to each
+                :meth:`parallel_hire` call (default 8).
+            progress: Show a Rich progress bar per batch (default True).
+        """
+        if n <= 0:
+            return
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        num_batches = (n + batch_size - 1) // batch_size
+        hired = 0
+        for batch_idx in range(num_batches):
+            this_batch = min(batch_size, n - hired)
+            LOG.info(
+                "parallel_hire_in_batches on %s: batch %d/%d (%d workers, %d/%d total).",
+                self._experiment_name,
+                batch_idx + 1,
+                num_batches,
+                this_batch,
+                hired,
+                n,
+            )
+            self.parallel_hire(this_batch, workers=workers, progress=progress)
+            hired += this_batch
+            if batch_idx < num_batches - 1 and delay > 0:
+                LOG.info(
+                    "parallel_hire_in_batches on %s: sleeping %.1fs before batch %d/%d.",
+                    self._experiment_name,
+                    delay,
+                    batch_idx + 2,
+                    num_batches,
+                )
+                time.sleep(delay)
 
     def __str__(self):
         return f"Workforce(experiment_name={self._experiment_name})"
@@ -815,6 +918,13 @@ class Workforce:
     # transient blip.
     _RESUME_MAX_RETRIES = 3
 
+    # Max retry attempts for transient 5xx / 429 from the AzureML index
+    # endpoint backing ``list_jobs``. The nginx front-door in front of
+    # ``ml.azure.com`` returns raw HTML 503s during regional load spikes;
+    # retrying in-process is far cheaper than propagating a failure into
+    # autoscaling / status display.
+    _LIST_JOBS_MAX_RETRIES = 3
+
     @staticmethod
     def _resume_retry_delay(response: requests.Response, attempt: int) -> float:
         """Return the sleep delay before the next resume retry.
@@ -836,6 +946,73 @@ class Workforce:
             except ValueError:
                 pass
         return min(2.0**attempt, 30.0) + random.uniform(0, 1)
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        endpoint_label: str,
+        max_retries: int | None = None,
+        timeout: float = 60.0,
+        **kwargs,
+    ) -> requests.Response:
+        """Issue an HTTP request with retry on transient failures.
+
+        Retries both:
+        - Connection-level errors (DNS failures, TCP resets, read
+          timeouts) raised by ``requests`` as ``RequestException``
+          subclasses. Common in multi-region autoscaling when a local
+          resolver briefly fails or a regional endpoint is momentarily
+          unreachable.
+        - HTTP responses with status 5xx or 429, honoring
+          ``Retry-After`` / ``x-ms-retry-after-ms`` with exponential
+          backoff fallback (:meth:`_resume_retry_delay`).
+
+        On exhausting retries the final response (or the last exception)
+        is returned / re-raised to the caller.
+        """
+        retries = max_retries if max_retries is not None else self._LIST_JOBS_MAX_RETRIES
+        last_exc: requests.exceptions.RequestException | None = None
+        for attempt in range(retries + 1):
+            try:
+                response = self.session.request(method, url, timeout=timeout, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt == retries:
+                    raise
+                delay = min(2.0**attempt, 30.0) + random.uniform(0, 1)
+                LOG.warning(
+                    "%s on %s network error %s: %s; retrying in %.1fs (attempt %d/%d)",
+                    endpoint_label,
+                    self._experiment_name,
+                    type(exc).__name__,
+                    exc,
+                    delay,
+                    attempt + 1,
+                    retries,
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code < 500 and response.status_code != 429:
+                return response
+            if attempt == retries:
+                return response
+            delay = self._resume_retry_delay(response, attempt)
+            LOG.warning(
+                "%s on %s got HTTP %d; retrying in %.1fs (attempt %d/%d)",
+                endpoint_label,
+                self._experiment_name,
+                response.status_code,
+                delay,
+                attempt + 1,
+                retries,
+            )
+            time.sleep(delay)
+        # Unreachable — loop always returns or raises. Kept for type-checkers.
+        assert last_exc is not None
+        raise last_exc
 
     def _resume_one(self, worker: AmlJob) -> None:
         """Resume a single paused job via the MFE execution REST API.
@@ -964,7 +1141,13 @@ class Workforce:
 
         token = self._credential.get_token("https://management.core.windows.net/.default")
         headers = {"Authorization": f"Bearer {token.token}", "Content-Type": "application/json"}
-        response = self.session.get(url, headers=headers)
+
+        # Retry transient 5xx / 429 and connection-level errors (DNS
+        # failures, TCP resets, read timeouts). ARM get-compute can blip
+        # under regional load just like the MFE list endpoint.
+        response = self._request_with_retry(
+            "GET", url, headers=headers, endpoint_label="get_compute_infos"
+        )
 
         if response.status_code != 200:
             raise RuntimeError(
