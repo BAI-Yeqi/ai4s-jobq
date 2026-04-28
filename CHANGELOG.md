@@ -1,6 +1,70 @@
 CHANGELOG
 =========
 
+3.10.0 (2026-04-28)
+-------------------
+
+Features:
+
+* **Track dashboard improvements.**
+  Redesigned the ``ai4s-jobq track`` dashboard toolbar with a cleaner layout,
+  added time range presets (``6h``/``12h``/``24h``/``3d``/``7d``), configurable refresh interval,
+  and a group-by toggle to switch between overall and per-environment
+  breakdowns in Active Workers, CPU, RAM, Preemptions, and Tasks Started panels.
+  Disabled the Plotly toolbar on all graphs and added a per-graph expand button
+  (⛶) for fullscreen inspection (press Escape to close).
+
+* **New stat cards.**
+  Added big-number stat cards showing succeeded/failed per day,
+  succeeded/failed per worker-day (normalized for worker uptime),
+  average time to success, and average time to failure.
+
+* **Daily moving average panel.**
+  New trend line showing a 24-hour rolling average of task completions and failures.
+
+* **Fan charts for resource utilization.**
+  Task runtimes, CPU utilization, and RAM utilization panels now render as fan
+  charts with percentile bands (p10–p90, p25–p75) when in overall grouping mode,
+  giving a clearer picture of distribution over time.
+
+* **Workforce monitoring section.**
+  New dedicated section with panels for worker churn (arrivals vs departures),
+  worker lifetime distribution, average time to preemption by environment
+  (top and bottom 10), and tasks-per-preemption efficiency ratio. Active
+  workers and active environments panels moved into this section.
+
+* **Workspace auto-detection.**
+  The dashboard now detects all AML workspaces associated with the selected
+  queue and displays them in the toolbar. The workspace filter was removed from
+  data queries since a single queue can span multiple workspaces.
+
+Bug fixes:
+
+* Fixed queue dropdown resetting to the CLI value on every callback refresh.
+* Fixed tasks completed/failed graph showing swapped colors (Succeeded was
+  plotted as red, Failed as green).
+* Fixed failure double-counting caused by combining AppTraces and AppExceptions
+  (each failure was counted twice).
+* Fixed date format bug (``%Y-%M-%D`` → ``%Y-%m-%d``).
+* Fixed pandas ``ChainedAssignmentError`` in the errors panel.
+* Fixed worker churn panel crash when the KQL response had fewer columns than
+  expected.
+* **ProcessPool no longer deadlocks when the parent has background threads.**
+  Both ``ProcessPool._create_pool()`` and the ``multiprocessing.Manager``
+  used for log forwarding now use the ``forkserver`` start method instead of
+  the default ``fork``. With ``fork``, child processes inherit the parent's
+  memory—including C-level locks held by native extensions such as the Azure
+  SDK (MSAL token cache), OpenSSL, or ``aiohttp`` connection pools. Because
+  the owning thread does not exist in the child, any code path that acquires
+  such a lock deadlocks. Python 3.12 made standard-library locks fork-safe,
+  but C-extension locks remain vulnerable. ``forkserver`` avoids the problem
+  by forking children from a clean, single-threaded server process. On
+  Windows, ``spawn`` is used instead (``forkserver`` is not available). This
+  fix is relevant for any deployment where ``ProcessPool`` workers run
+  alongside Azure SDK credentials or other native libraries with background
+  threads.
+
+
 3.9.2 (2026-04-24)
 ------------------
 
@@ -54,56 +118,6 @@ Fixes:* **``Workforce.get_compute_infos`` accepts either a bare compute name
   ``APPLICATIONINSIGHTS_CONNECTION_STRING`` was propagated as the
   ``True`` / ``False`` result of the presence check instead of the
   actual connection string.
-
-
-3.10.0 (2026-04-28)
--------------------
-
-Features:
-
-* **Track dashboard improvements.**
-  Redesigned the ``ai4s-jobq track`` dashboard toolbar with a cleaner layout,
-  added time range presets (``6h``/``12h``/``24h``/``3d``/``7d``), configurable refresh interval,
-  and a group-by toggle to switch between overall and per-environment
-  breakdowns in Active Workers, CPU, RAM, Preemptions, and Tasks Started panels.
-  Disabled the Plotly toolbar on all graphs and added a per-graph expand button
-  (⛶) for fullscreen inspection (press Escape to close).
-
-* **New stat cards.**
-  Added big-number stat cards showing succeeded/failed per day,
-  succeeded/failed per worker-day (normalized for worker uptime),
-  average time to success, and average time to failure.
-
-* **Daily moving average panel.**
-  New trend line showing a 24-hour rolling average of task completions and failures.
-
-* **Fan charts for resource utilization.**
-  Task runtimes, CPU utilization, and RAM utilization panels now render as fan
-  charts with percentile bands (p10–p90, p25–p75) when in overall grouping mode,
-  giving a clearer picture of distribution over time.
-
-* **Workforce monitoring section.**
-  New dedicated section with panels for worker churn (arrivals vs departures),
-  worker lifetime distribution, average time to preemption by environment
-  (top and bottom 10), and tasks-per-preemption efficiency ratio. Active
-  workers and active environments panels moved into this section.
-
-* **Workspace auto-detection.**
-  The dashboard now detects all AML workspaces associated with the selected
-  queue and displays them in the toolbar. The workspace filter was removed from
-  data queries since a single queue can span multiple workspaces.
-
-Bug fixes:
-
-* Fixed queue dropdown resetting to the CLI value on every callback refresh.
-* Fixed tasks completed/failed graph showing swapped colors (Succeeded was
-  plotted as red, Failed as green).
-* Fixed failure double-counting caused by combining AppTraces and AppExceptions
-  (each failure was counted twice).
-* Fixed date format bug (``%Y-%M-%D`` → ``%Y-%m-%d``).
-* Fixed pandas ``ChainedAssignmentError`` in the errors panel.
-* Fixed worker churn panel crash when the KQL response had fewer columns than
-  expected.
 
 
 3.9.0 (2026-04-23)
