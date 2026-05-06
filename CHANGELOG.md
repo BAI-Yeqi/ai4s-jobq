@@ -1,10 +1,15 @@
 CHANGELOG
 =========
 
-Unreleased
-----------
+3.12.0 (2026-05-06)
+-------------------
 
 Features:
+
+* **Higher scaling tiers in ``MultiRegionWorkforce``.**
+  Added two new auto-scaling tiers: queues with more than 100_000 pending
+  tasks per worker now scale up to 5_000 workers, and queues above 50_000
+  scale up to 2_000 workers (previously capped at 1_000).
 
 * **``MultiRegionWorkforce`` opt-in parallel region reads.**
   New constructor flag ``parallel_region_reads`` (default ``False``) fans out

@@ -343,7 +343,11 @@ class MultiRegionWorkforce:
         max_number_after_scaling = (1 + num_running_workers) * 10
 
         # Now we choose a minimum workforce size based on the queue size.
-        if queue_size // self.num_workers > 10000:
+        if queue_size // self.num_workers > 100000:
+            scale_to = min(max_number_after_scaling, 5000)
+        elif queue_size // self.num_workers > 50000:
+            scale_to = min(max_number_after_scaling, 2000)
+        elif queue_size // self.num_workers > 10000:
             scale_to = min(max_number_after_scaling, 1000)
         elif queue_size // self.num_workers > 1000:
             scale_to = min(max_number_after_scaling, 400)
