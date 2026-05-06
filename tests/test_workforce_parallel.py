@@ -47,6 +47,8 @@ def _bare_workforce(**overrides) -> Workforce:
 
     We set only the attributes touched by the methods under test.
     """
+    import threading
+
     wf = Workforce.__new__(Workforce)
     wf._experiment_name = "exp"
     wf._aml_client = MagicMock()
@@ -56,6 +58,9 @@ def _bare_workforce(**overrides) -> Workforce:
     wf._aml_client.subscription_id = "sub"
     wf._aml_client.resource_group_name = "rg"
     wf._aml_client.workspace_name = "ws"
+    wf._image_resolver = None
+    wf._env_register_lock = threading.Lock()
+    wf._registered_env_id_cache = {}
     for k, v in overrides.items():
         setattr(wf, k, v)
     return wf

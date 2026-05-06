@@ -221,13 +221,27 @@ class _StubJob:
         self.name = ""
 
 
-def _apply_resolver_to_job(resolver: ImageDigestResolver, job: _StubJob) -> _StubJob:
-    """Run the same image-rewriting logic as ``Workforce._build_worker``.
+def _apply_resolver_to_job(
+    resolver: ImageDigestResolver | None,
+    job: _StubJob,
+    register_fn=None,
+) -> _StubJob:
+    """Run the same image-rewriting + env-registration logic as
+    ``Workforce._build_worker``.
 
     Mirrors the production path without spinning up a full ``Workforce``
-    (which requires an ``MLClient`` and a credential at construction).  If
-    the production logic changes, this helper must change too — keeping
-    the test honest.
+    (which requires an ``MLClient`` and a credential at construction).
+    If the production logic changes, this helper must change too —
+    keeping the test honest.
+
+    The Workforce, after rewriting the image, pre-registers the new
+    Environment via ``MLClient.environments.create_or_update`` and
+    substitutes the returned ARM id (a string) for ``job.environment``
+    — this avoids the ``ResourceExistsError`` race where every
+    concurrent job submission re-registers the same content-hash
+    anonymous environment. Here that registration is represented by
+    ``register_fn(env) -> str``; tests that exercise the rewrite path
+    must pass one.
     """
     import copy as _copy
 
@@ -238,17 +252,29 @@ def _apply_resolver_to_job(resolver: ImageDigestResolver, job: _StubJob) -> _Stu
         if resolved != original_image:
             new_env = _copy.copy(env)
             new_env.image = resolved
-            job.environment = new_env
+            assert register_fn is not None, "register_fn required for resolver rewrite"
+            job.environment = register_fn(new_env)
     return job
 
 
 class TestWorkforceIntegration:
     def test_image_rewritten_on_resolved_environment(self):
         r = _make_resolver()
+        registered: list = []
+
+        def register(env):
+            registered.append(env)
+            return "/fake/arm/id/CliV2AnonymousEnvironment/versions/abc"
+
         with patch.object(r, "_fetch_digest", return_value=_DIGEST):
             job = _StubJob(environment=_StubEnvironment(image=_TAG_URI))
-            _apply_resolver_to_job(r, job)
-        assert job.environment.image == _DIGEST_URI
+            _apply_resolver_to_job(r, job, register)
+        # The Environment passed to the SDK's pre-registration step carries
+        # the digest-pinned image; the job ends up referencing the ARM id
+        # by string so the SDK skips its own (race-prone) re-registration.
+        assert len(registered) == 1
+        assert registered[0].image == _DIGEST_URI
+        assert job.environment == "/fake/arm/id/CliV2AnonymousEnvironment/versions/abc"
 
     def test_no_resolver_leaves_image_alone(self):
         job = _StubJob(environment=_StubEnvironment(image=_TAG_URI))
@@ -280,10 +306,18 @@ class TestWorkforceIntegration:
         r = _make_resolver()
         original_env = _StubEnvironment(image=_TAG_URI)
         job = _StubJob(environment=original_env)
+        registered: list = []
+
+        def register(env):
+            registered.append(env)
+            return "/fake/arm/id/CliV2AnonymousEnvironment/versions/abc"
+
         with patch.object(r, "_fetch_digest", return_value=_DIGEST):
-            _apply_resolver_to_job(r, job)
+            _apply_resolver_to_job(r, job, register)
         # Prototype's env keeps its tag; the rewritten image lives on a
-        # fresh Environment held by the per-worker job copy.
+        # fresh Environment that is then registered, with the job ending
+        # up holding only its ARM id string.
         assert original_env.image == _TAG_URI
-        assert job.environment is not original_env
-        assert job.environment.image == _DIGEST_URI
+        assert registered[0] is not original_env
+        assert registered[0].image == _DIGEST_URI
+        assert job.environment == "/fake/arm/id/CliV2AnonymousEnvironment/versions/abc"
