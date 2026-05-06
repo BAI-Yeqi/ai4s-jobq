@@ -160,11 +160,20 @@ class AcrAadAuth:
       1. Acquire an AAD access token (any scope the registry trusts; we
          use the ARM management scope by convention).
       2. Exchange it at ``https://{registry}/oauth2/exchange`` for an ACR
-         refresh token.
+         refresh token.  The exchange POST includes ``tenant=`` (extracted
+         from the token's ``iss`` claim) — without it some tenants 401.
       3. Exchange the refresh token at ``https://{registry}/oauth2/token``
          for a repo-scoped pull access token.
 
     The principal must have AcrPull (or stronger) on the registry.
+
+    Default credential: ``ChainedTokenCredential`` that tries
+    ``AzureCliCredential`` before ``DefaultAzureCredential``.  On Azure
+    VMs ``DefaultAzureCredential`` will pick the VM's managed identity
+    first, which often lacks AcrPull on the registry; preferring the CLI
+    login (i.e. the operator's interactive ``az login`` identity) keeps
+    things working on dev/op boxes.  Override ``credential`` for service
+    accounts in production.
 
     Token responses are not cached here — the outer
     :class:`ImageDigestResolver` cache typically prevents re-acquisition.
@@ -176,19 +185,27 @@ class AcrAadAuth:
         # Defer the import so non-ACR users don't pay the azure-identity
         # import cost (or even need azure-identity installed).
         if credential is None:
-            from azure.identity import DefaultAzureCredential
+            from azure.identity import (
+                AzureCliCredential,
+                ChainedTokenCredential,
+                DefaultAzureCredential,
+            )
 
-            credential = DefaultAzureCredential()
+            # Prefer the operator's `az login` identity over any managed
+            # identity attached to the host (which often lacks AcrPull).
+            credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
         self._credential: TokenCredential = credential
 
     def get_pull_token(self, registry: str, repo: str) -> str:
         aad_token = self._credential.get_token(_AAD_SCOPE_FOR_ACR).token
+        tenant_id = _tenant_from_jwt(aad_token)
 
         exchange_resp = requests.post(
             f"https://{registry}/oauth2/exchange",
             data={
                 "grant_type": "access_token",
                 "service": registry,
+                "tenant": tenant_id,
                 "access_token": aad_token,
             },
             timeout=_HTTP_TIMEOUT_S,
@@ -358,6 +375,32 @@ def _parse_image_uri(image_uri: str) -> tuple[str, str, str]:
         else:
             repo, tag = rest, "latest"
     return registry, repo, tag
+
+
+def _tenant_from_jwt(jwt_token: str) -> str:
+    """Decode an AAD access token and return the tenant id from ``iss``.
+
+    The ``iss`` claim is shaped like
+    ``https://sts.windows.net/{tenant_id}/``; we split and grab the path
+    segment.  We don't verify the signature — this is just for the
+    tenant_id field on the ACR exchange POST.
+    """
+    import base64
+    import json as _json
+
+    # JWT = header.payload.signature; we only need the payload.
+    try:
+        payload_b64 = jwt_token.split(".")[1]
+    except IndexError as e:
+        raise ValueError("malformed JWT (no payload segment)") from e
+    # base64url decode with padding fix-up
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+    payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+    iss: str = payload.get("iss", "")
+    parts = iss.rstrip("/").split("/")
+    if len(parts) < 4:
+        raise ValueError(f"unexpected iss format in AAD token: {iss!r}")
+    return parts[-1]
 
 
 def _format_digest_uri(image_uri: str, digest: str) -> str:
