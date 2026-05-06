@@ -41,7 +41,10 @@ from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
 
 import jwt
 import requests
@@ -237,6 +240,7 @@ class Workforce:
         servicebus_resource_group: str | None = None,
         servicebus_namespace: str | None = None,
         servicebus_topic: str | None = None,
+        image_resolver: "ImageDigestResolver | None" = None,
     ):
         self._job = worker_prototype
         self._experiment_name = experiment_name
@@ -252,10 +256,22 @@ class Workforce:
         self._create_servicebus_resources()
         self.cluster_type: str | None = None
         self.session = requests.Session()
+        # Optional resolver that rewrites the prototype's image tag to a
+        # ``@sha256:...`` digest at hire-time so all workers in a session
+        # pull identical content.  See :mod:`image_resolver` for details.
+        self._image_resolver = image_resolver
         t = self._credential.get_token("https://management.azure.com/.default")
         self.tenant_id = jwt.decode(t.token, options={"verify_signature": False})["iss"].split("/")[
             3
         ]
+
+    def set_image_resolver(self, resolver: "ImageDigestResolver | None") -> None:
+        """Install (or clear) an image resolver after construction.
+
+        Used by :class:`MultiRegionWorkforce` to share one resolver across
+        all child workforces from a single point of configuration.
+        """
+        self._image_resolver = resolver
 
     def _create_servicebus_resources(self):
         """
@@ -566,6 +582,13 @@ class Workforce:
         previous implementation: ``InputsAttrDict`` is not deep-copyable),
         but shallow copy plus a fresh ``environment_variables`` dict is
         enough — no other attribute is mutated per-worker.
+
+        If an ``image_resolver`` is configured, the prototype's
+        ``environment.image`` tag is rewritten to a content-digest URI so
+        all hires within the resolver's TTL window pull identical bytes
+        (see :mod:`image_resolver`).  The prototype's Environment is not
+        mutated — a shallow copy is taken so concurrent ``_build_worker``
+        calls don't race.
         """
         job = copy.copy(self._job)
         # Give the copy its own env dict so parallel workers don't race on setdefault.
@@ -576,6 +599,22 @@ class Workforce:
         job.experiment_name = self._experiment_name
         random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         job.name = f"{self._experiment_name}-{random_id}"
+
+        # Image-digest pinning: rewrite ``image:tag`` to ``image@sha256:...``
+        # if a resolver is configured and the prototype carries an
+        # Environment with a string image attribute.  String-named
+        # registered AML environments (e.g. ``"AzureML-PyTorch-1.10:1"``)
+        # don't have ``.image`` and are skipped.
+        if self._image_resolver is not None:
+            env = job.environment
+            original_image = getattr(env, "image", None)
+            if original_image:
+                resolved = self._image_resolver.resolve(original_image)
+                if resolved != original_image:
+                    new_env = copy.copy(env)
+                    new_env.image = resolved
+                    job.environment = new_env
+
         return job
 
     def _run_parallel(

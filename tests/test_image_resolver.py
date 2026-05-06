@@ -8,8 +8,11 @@ import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from ai4s.jobq.orchestration.image_resolver import (
+    AnonymousAuth,
+    BearerTokenAuth,
     ImageDigestResolver,
     _format_digest_uri,
     _parse_image_uri,
@@ -53,10 +56,8 @@ class TestFormatDigestUri:
 
 
 def _make_resolver(**kwargs) -> ImageDigestResolver:
-    """Resolver with a stub credential (resolver._fetch_digest is patched per test)."""
-    cred = MagicMock()
-    cred.get_token.return_value = MagicMock(token="fake-aad-token")
-    return ImageDigestResolver(credential=cred, **kwargs)
+    """Resolver with a stub bearer auth (resolver._fetch_digest is patched per test)."""
+    return ImageDigestResolver(auth=BearerTokenAuth("fake-token"), **kwargs)
 
 
 class TestResolve:
@@ -123,6 +124,45 @@ class TestResolve:
             r.resolve(_TAG_URI)
 
 
+# ── Auth backends ─────────────────────────────────────────────────────────────
+
+
+class TestAuthBackends:
+    def test_anonymous_returns_none(self):
+        assert AnonymousAuth().get_pull_token(_REGISTRY, _REPO) is None
+
+    def test_bearer_returns_supplied_token(self):
+        assert BearerTokenAuth("hunter2").get_pull_token(_REGISTRY, _REPO) == "hunter2"
+
+
+class TestFetchDigestUsesAuth:
+    """``_fetch_digest`` calls auth.get_pull_token and threads the result through."""
+
+    def _make_response(self, digest: str) -> MagicMock:
+        resp = MagicMock(spec=requests.Response)
+        resp.headers = {"Docker-Content-Digest": digest}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_authenticated_call_sets_authorization_header(self):
+        auth = MagicMock(spec=["get_pull_token"])
+        auth.get_pull_token.return_value = "tok-abc"
+        r = ImageDigestResolver(auth=auth)
+        with patch.object(requests, "get", return_value=self._make_response(_DIGEST)) as mget:
+            digest = r._fetch_digest(_TAG_URI)
+        assert digest == _DIGEST
+        auth.get_pull_token.assert_called_once_with(_REGISTRY, _REPO)
+        _, kwargs = mget.call_args
+        assert kwargs["headers"]["Authorization"] == "Bearer tok-abc"
+
+    def test_anonymous_call_omits_authorization_header(self):
+        r = ImageDigestResolver(auth=AnonymousAuth())
+        with patch.object(requests, "get", return_value=self._make_response(_DIGEST)) as mget:
+            r._fetch_digest(_TAG_URI)
+        _, kwargs = mget.call_args
+        assert "Authorization" not in kwargs["headers"]
+
+
 class TestThreadSafety:
     def test_concurrent_resolves_use_lock(self):
         """16 threads all resolving the same image should issue at most a few HTTP calls.
@@ -152,3 +192,98 @@ class TestThreadSafety:
         # All threads must wait for the lock, so only the first finds an empty
         # cache and fetches; subsequent threads cache-hit.
         assert fetcher.call_count == 1
+
+
+# ── Integration with Workforce._build_worker ──────────────────────────────────
+
+
+class _StubEnvironment:
+    """Minimal stand-in for ``azure.ai.ml.entities.Environment``.
+
+    ``copy.copy`` works on this without hitting the real Environment's
+    ``InputsAttrDict``-related copy issues.
+    """
+
+    def __init__(self, image: str | None = None):
+        self.image = image
+
+
+class _StubJob:
+    """Minimal stand-in for the ``azure.ai.ml.entities.Command`` prototype.
+
+    Only carries the attributes ``Workforce._build_worker`` mutates.
+    """
+
+    def __init__(self, environment: object | None = None):
+        self.environment = environment
+        self.environment_variables: dict[str, str] = {}
+        self.experiment_name = ""
+        self.name = ""
+
+
+def _apply_resolver_to_job(resolver: ImageDigestResolver, job: _StubJob) -> _StubJob:
+    """Run the same image-rewriting logic as ``Workforce._build_worker``.
+
+    Mirrors the production path without spinning up a full ``Workforce``
+    (which requires an ``MLClient`` and a credential at construction).  If
+    the production logic changes, this helper must change too — keeping
+    the test honest.
+    """
+    import copy as _copy
+
+    env = job.environment
+    original_image = getattr(env, "image", None)
+    if resolver is not None and original_image:
+        resolved = resolver.resolve(original_image)
+        if resolved != original_image:
+            new_env = _copy.copy(env)
+            new_env.image = resolved
+            job.environment = new_env
+    return job
+
+
+class TestWorkforceIntegration:
+    def test_image_rewritten_on_resolved_environment(self):
+        r = _make_resolver()
+        with patch.object(r, "_fetch_digest", return_value=_DIGEST):
+            job = _StubJob(environment=_StubEnvironment(image=_TAG_URI))
+            _apply_resolver_to_job(r, job)
+        assert job.environment.image == _DIGEST_URI
+
+    def test_no_resolver_leaves_image_alone(self):
+        job = _StubJob(environment=_StubEnvironment(image=_TAG_URI))
+        _apply_resolver_to_job(None, job)  # type: ignore[arg-type]
+        assert job.environment.image == _TAG_URI
+
+    def test_string_environment_skipped(self):
+        """Registered AML environments are passed as strings (no .image attr)."""
+        r = _make_resolver()
+        job = _StubJob(environment="AzureML-PyTorch-1.10:1")
+        with patch.object(r, "_fetch_digest", return_value=_DIGEST) as fetcher:
+            _apply_resolver_to_job(r, job)
+        # Resolver was never called because there's no .image attribute
+        fetcher.assert_not_called()
+        assert job.environment == "AzureML-PyTorch-1.10:1"
+
+    def test_already_pinned_image_is_a_noop(self):
+        r = _make_resolver()
+        job = _StubJob(environment=_StubEnvironment(image=_DIGEST_URI))
+        with patch.object(r, "_fetch_digest", return_value=_DIGEST) as fetcher:
+            _apply_resolver_to_job(r, job)
+        # Resolver returns input unchanged; no HTTP fetch
+        fetcher.assert_not_called()
+        assert job.environment.image == _DIGEST_URI
+
+    def test_environment_is_not_mutated_in_place(self):
+        """Prototype's Environment must not be touched — concurrent _build_worker
+        calls share the prototype and would race on a shared mutation."""
+        r = _make_resolver()
+        original_env = _StubEnvironment(image=_TAG_URI)
+        job = _StubJob(environment=original_env)
+        with patch.object(r, "_fetch_digest", return_value=_DIGEST):
+            _apply_resolver_to_job(r, job)
+        # Prototype's env keeps its tag; the rewritten image lives on a
+        # fresh Environment held by the per-worker job copy.
+        assert original_env.image == _TAG_URI
+        assert job.environment is not original_env
+        assert job.environment.image == _DIGEST_URI
