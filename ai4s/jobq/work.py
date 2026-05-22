@@ -535,6 +535,9 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
                         )
                     except Empty:
                         continue
+                    except (BrokenPipeError, ConnectionResetError, EOFError):
+                        LOG.debug("Log message queue connection lost (manager shut down).")
+                        break
                     except Exception:
                         LOG.exception("Error in logging message queue.")
                         continue

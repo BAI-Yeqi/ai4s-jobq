@@ -1,10 +1,16 @@
 CHANGELOG
 =========
 
-3.12.1 (2026-05-20)
+3.12.1 (2026-05-22)
 -------------------
 
 Fixes:
+
+* **Suppress log queue error spam during shutdown.**
+  When the multiprocessing Manager is terminated during preemption or
+  SIGTERM, ``log_from_queue`` no longer retries indefinitely on
+  ``BrokenPipeError``/``ConnectionResetError``—it exits the loop
+  cleanly with a DEBUG message.
 
 * **Storage Queue: detect lock loss on sustained heartbeat failure.**
   Previously, if heartbeat updates failed with non-HTTP errors (network
