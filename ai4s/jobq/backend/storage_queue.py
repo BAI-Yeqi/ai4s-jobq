@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 import asyncio
 import logging
+import time
 import typing as ty
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import replace as replace_in_dataclass
@@ -266,6 +267,9 @@ class StorageQueueBackend(JobQBackend):
         """
 
         async def _heartbeat() -> None:
+            last_success = time.monotonic()
+            lock_duration = visibility_timeout.total_seconds()
+            lock_lost_logged = False
             try:
                 while not cancel_heartbeat_event.is_set():
                     pop_receipt = message.pop_receipt
@@ -281,11 +285,13 @@ class StorageQueueBackend(JobQBackend):
                             await self.queue_client.update_message(
                                 message,
                                 pop_receipt=pop_receipt,
-                                visibility_timeout=int(visibility_timeout.total_seconds()),
+                                visibility_timeout=int(lock_duration),
                                 timeout=round(interval),
                             )
                         ).pop_receipt
                         message.pop_receipt = pop_receipt
+                        last_success = time.monotonic()
+                        lock_lost_logged = False
                         LOG.debug(
                             "Received Heartbeat pop receipt for %s: %s",
                             message.id,
@@ -308,6 +314,25 @@ class StorageQueueBackend(JobQBackend):
                         LOG.exception(
                             f"Failed to send heartbeat for message {message.id}: ", exc_info=e
                         )
+
+                    # If no successful heartbeat within visibility_timeout, the
+                    # message is visible again and another worker may pick it up.
+                    elapsed = time.monotonic() - last_success
+                    if elapsed > lock_duration and not lock_lost_logged:
+                        expired_ago = elapsed - lock_duration
+                        LOG.warning(
+                            "Lock likely expired for message %s: no successful heartbeat "
+                            "for %.0fs (visibility timeout %.0fs, expired ~%.0fs ago). "
+                            "Another worker may process this message.",
+                            message.id,
+                            elapsed,
+                            lock_duration,
+                            expired_ago,
+                        )
+                        lock_lost_logged = True
+                        lock_lost_event.set()
+                        return
+
                     with suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(cancel_heartbeat_event.wait(), interval)
             finally:

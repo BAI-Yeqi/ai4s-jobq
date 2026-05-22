@@ -1,6 +1,20 @@
 CHANGELOG
 =========
 
+3.12.1 (2026-05-20)
+-------------------
+
+Fixes:
+
+* **Storage Queue: detect lock loss on sustained heartbeat failure.**
+  Previously, if heartbeat updates failed with non-HTTP errors (network
+  timeouts, DNS failures, connection resets), the heartbeat loop retried
+  indefinitely without declaring lock loss. Now tracks time since last
+  successful heartbeat; if it exceeds the visibility timeout, sets
+  ``lock_lost_event`` and logs a warning—matching the Service Bus
+  backend behavior.
+
+
 3.12.0 (2026-05-06)
 -------------------
 
