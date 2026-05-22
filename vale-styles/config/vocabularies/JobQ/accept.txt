@@ -28,6 +28,7 @@ UUID[s]?
 [Dd]eserializ(e|ation)
 [Dd]irsync
 [Dd]ownscaling
+[Ee]nqueue[d]?
 [Ee]nqueueing
 [Ee]nqueuing
 [Ee]nv

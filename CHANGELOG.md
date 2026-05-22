@@ -6,6 +6,17 @@ CHANGELOG
 
 Fixes:
 
+* **Lock-loss now kills the affected subprocess immediately.**
+  After PR #59 removed the blast-radius ``_kill_subprocesses`` call from
+  ``ProcessPool.submit()``, a cancelled task's subprocess continued running
+  without any message lock—leading to duplicate execution when another
+  worker picked up the same message.  ``submit()`` now tracks the pool
+  child's PID via a temp file and sends ``SIGUSR2`` on ``CancelledError``.
+  The pool child responds by sending ``SIGKILL`` to the subprocess's
+  process group—no graceful shutdown, since the lock is already lost and
+  checkpointing would conflict. Preemption/shutdown still uses graceful
+  ``SIGTERM`` via ``SIGUSR1``.
+
 * **Suppress log queue error spam during shutdown.**
   When the multiprocessing Manager is terminated during preemption or
   SIGTERM, ``log_from_queue`` no longer retries indefinitely on

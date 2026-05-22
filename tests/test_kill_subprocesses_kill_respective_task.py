@@ -123,22 +123,17 @@ async def test_kill_subprocesses_sends_sigterm_to_all_workers():
             statuses[i] = "MISSING"
     print(f"[{_ts()}] Task statuses: {statuses}", flush=True)
 
-    # task_0 was explicitly cancelled — it should have received SIGTERM, but will still exist with COMPLETED.
-    assert statuses[0] == "COMPLETED", (
-        f"task_0 was cancelled but status is {statuses[0]!r} (expected 'COMPLETED')"
+    # task_0 was explicitly cancelled (lock loss) — receives SIGKILL to its process group.
+    # SIGKILL cannot be trapped, so the marker stays at "RUNNING" (never transitions).
+    assert statuses[0] == "RUNNING", (
+        f"task_0 was cancelled (SIGKILL) but status is {statuses[0]!r} (expected 'RUNNING')"
     )
 
-    # BUG: the other tasks ALSO received SIGTERM because _kill_subprocesses
-    # sends SIGUSR1 to ALL pool children, not just the one running task_0.
-    #
-    # After fixing, these assertions should FLIP:
-    # - Currently (bug): statuses[1] == "SIGTERM", statuses[2] == "SIGTERM"
-    # - After fix:        statuses[1] == "COMPLETED", statuses[2] == "COMPLETED"
+    # The other tasks should NOT be affected — only task_0 was cancelled.
     for i in range(1, NUM_POOL_WORKERS):
         assert statuses[i] == "COMPLETED", (
-            f"task_{i} was NOT cancelled but received SIGTERM anyway. "
-            f"This is the _kill_subprocesses blast-radius bug: cancelling "
-            f"task_0 killed ALL pool children.\n"
+            f"task_{i} was NOT cancelled but did not complete. "
+            f"Cancelling task_0 should not affect other pool children.\n"
             f"All statuses: {statuses}"
         )
 
@@ -182,4 +177,86 @@ async def test_cancelled_task_is_requeued(azurite_connstr):
         assert len(msgs) >= 1, (
             "Cancelled task's message should be requeued and visible after "
             "the visibility timeout expires."
+        )
+
+
+async def test_sigterm_lock_lost_behavior(monkeypatch):
+    """With JOBQ_LOCK_LOST_BEHAVIOR=sigterm, lock loss sends SIGTERM (trappable).
+
+    Unlike the default SIGKILL behavior, SIGTERM can be caught by the subprocess.
+    The subprocess trap handler fires, writes 'SIGTERM' to the marker file, and
+    exits — proving the graceful path works.
+    """
+    monkeypatch.setenv("JOBQ_LOCK_LOST_BEHAVIOR", "sigterm")
+    marker_dir = tempfile.mkdtemp(prefix="jobq_sigterm_lock_lost_")
+
+    async with ShellCommandProcessor(num_workers=NUM_POOL_WORKERS) as proc:
+        tasks: list[asyncio.Task] = []
+        for i in range(NUM_POOL_WORKERS):
+            marker = os.path.join(marker_dir, f"task_{i}.status")
+            script = textwrap.dedent(f"""\
+                trap 'echo SIGTERM > {marker}; exit 1' TERM
+                echo RUNNING > {marker}
+                sleep {TASK_DURATION_S}
+                echo COMPLETED > {marker}
+            """).strip()
+            task = asyncio.create_task(
+                proc(cmd=script, _job_id=f"task_{i}"),
+                name=f"task-{i}",
+            )
+            tasks.append(task)
+
+        # Wait for all tasks to actually start running.
+        for _attempt in range(20):
+            await asyncio.sleep(0.5)
+            running = sum(
+                1
+                for i in range(NUM_POOL_WORKERS)
+                if Path(marker_dir, f"task_{i}.status").is_file()
+                and Path(marker_dir, f"task_{i}.status").read_text().strip() == "RUNNING"
+            )
+            if running == NUM_POOL_WORKERS:
+                break
+        else:
+            for t in tasks:
+                t.cancel()
+            pytest.fail(f"Only {running}/{NUM_POOL_WORKERS} tasks started within 10 s")
+
+        print(f"[{_ts()}] All {NUM_POOL_WORKERS} tasks confirmed RUNNING", flush=True)
+
+        # ── Cancel exactly ONE task (simulates lock-loss cancellation) ──
+        tasks[0].cancel()
+        with contextlib.suppress(asyncio.CancelledError, WorkerCanceled, RuntimeError):
+            await tasks[0]
+        print(f"[{_ts()}] task_0 cancelled (SIGTERM mode)", flush=True)
+
+        # ── Wait for the other tasks to settle ──────────────────────────
+        for t in tasks[1:]:
+            with contextlib.suppress(
+                asyncio.CancelledError, WorkerCanceled, RuntimeError, TimeoutError
+            ):
+                await asyncio.wait_for(t, timeout=TASK_DURATION_S + 10)
+
+    # ── Read marker files ───────────────────────────────────────────────
+    statuses = {}
+    for i in range(NUM_POOL_WORKERS):
+        marker = Path(marker_dir, f"task_{i}.status")
+        if marker.is_file():
+            statuses[i] = marker.read_text().strip()
+        else:
+            statuses[i] = "MISSING"
+    print(f"[{_ts()}] Task statuses: {statuses}", flush=True)
+
+    # task_0 was cancelled with SIGTERM — the trap handler should have fired.
+    assert statuses[0] == "SIGTERM", (
+        f"task_0 was cancelled (SIGTERM mode) but status is {statuses[0]!r} "
+        f"(expected 'SIGTERM' from the trap handler)"
+    )
+
+    # The other tasks should NOT be affected — only task_0 was cancelled.
+    for i in range(1, NUM_POOL_WORKERS):
+        assert statuses[i] == "COMPLETED", (
+            f"task_{i} was NOT cancelled but did not complete. "
+            f"Cancelling task_0 should not affect other pool children.\n"
+            f"All statuses: {statuses}"
         )
