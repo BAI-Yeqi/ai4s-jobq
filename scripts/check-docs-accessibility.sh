@@ -11,6 +11,7 @@ rm -fr dist-doc ; sphinx-build -b html ./docs dist-doc
 python -m http.server $PORT --directory dist-doc >/dev/null 2>&1 &
 SERVER_PID=$!
 
+npx puppeteer browsers install chrome
 ./node_modules/.bin/pa11y-ci -s "$SERVER/sitemap.xml"
 
 kill $SERVER_PID || true

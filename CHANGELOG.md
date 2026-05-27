@@ -1,6 +1,13 @@
 CHANGELOG
 =========
 
+3.12.2 (2026-05-27)
+-------------------
+
+Misc:
+
+* servicebus: increase lock renewal frequency and add more logging
+
 3.12.1 (2026-05-22)
 -------------------
 

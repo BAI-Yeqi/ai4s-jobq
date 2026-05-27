@@ -687,7 +687,7 @@ class ServiceBusRestBackend(JobQBackend):
                             if stop_event.is_set():
                                 return
                             if retry_attempt < max_fast_retries:
-                                LOG.debug(
+                                LOG.info(
                                     "Transient renewal failure for message %s "
                                     "(attempt %d/%d): %s — retrying immediately",
                                     message.message_id,
@@ -706,7 +706,7 @@ class ServiceBusRestBackend(JobQBackend):
                             if stop_event.is_set():
                                 return
                             if retry_attempt < max_fast_retries:
-                                LOG.debug(
+                                LOG.info(
                                     "Transient renewal failure for message %s "
                                     "(attempt %d/%d) — retrying immediately",
                                     message.message_id,
@@ -785,7 +785,7 @@ class ServiceBusRestBackend(JobQBackend):
         if with_heartbeat:
             # Renew at half the actual lock duration reported by Service Bus,
             # NOT the application-level visibility_timeout which can be hours.
-            interval = max(message.lock_duration_seconds / 2, 5)
+            interval = max(message.lock_duration_seconds / 5, 5)
             lock_task, lock_stop_event = self._start_lock_renewal(
                 message, interval, lock_lost_event
             )
