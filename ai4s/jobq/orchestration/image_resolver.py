@@ -1,74 +1,19 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Resolve OCI / Docker registry image tags to immutable content digests.
+"""Resolve ACR image tags to immutable content digests at hire time.
 
-Why this exists
----------------
-Mutable tags (``:latest`` and even most dated tags unless the registry has
-content-immutability enabled) can be re-pushed in the registry after a
-workforce has hired some workers but before others spin up.  AML / Singularity
-/ Kubernetes / etc. pull the image on each node-allocation, so two workers in
-the same workforce session can end up running different image content.  That
-is poison for reproducibility: a long-running scheduler will silently mix
-builds.
+Mutable tags (even dated ones) can be re-pushed after some workers in a
+workforce session have already been hired.  Because AML pulls images on
+each node allocation, two workers in the same session can end up running
+different image content — poison for reproducibility.
 
-What this module does
----------------------
-Looks up the immutable content digest (``sha256:...``) of a registry tag once
-per (image, TTL window), caches it, and rewrites the image reference from
-``registry/repo:tag`` to ``registry/repo@sha256:...``.  All workers hired
-within the same TTL window pull the same content even if the tag is
-re-pushed mid-session.
+This module looks up the immutable content digest (``sha256:...``) of a
+tag via the ``azure-containerregistry`` SDK, caches it under a TTL, and
+rewrites the image reference from ``registry/repo:tag`` to
+``registry/repo@sha256:...``.
 
-Pluggable registry auth
------------------------
-The resolver is registry-agnostic by construction: the manifest endpoint
-(``GET /v2/{repo}/manifests/{tag}``) is OCI-standard.  Only token
-acquisition differs across registries, so authentication is delegated to a
-:class:`RegistryAuth` strategy:
-
-* :class:`AcrAadAuth` — Azure Container Registry via Azure AD identity
-  (the default; matches the typical AML / Singularity setup).
-* :class:`AnonymousAuth` — no authentication; works for public registries
-  / public repositories.
-* :class:`BearerTokenAuth` — pre-acquired bearer token; useful for tests
-  or for callers that obtain tokens out-of-band.
-
-Adding support for Docker Hub / GHCR / ECR / GCR is a matter of adding a
-small ``RegistryAuth`` implementation; nothing else in the resolver
-changes.
-
-Usage
------
-::
-
-    resolver = ImageDigestResolver(ttl_seconds=3600)              # ACR-AAD default
-    resolver = ImageDigestResolver(auth=AnonymousAuth())          # public registry
-    wf = Workforce(experiment_name=..., worker_prototype=proto,
-                   image_resolver=resolver)
-
-Cache semantics
----------------
-* TTL-based: digests are re-fetched after ``ttl_seconds`` (default 1 h).
-* Per-process: starting a fresh scheduler always re-resolves from scratch
-  (no on-disk cache).  This means each scheduler restart pins to "whatever
-  is in the registry right now" and stays on that for the session.
-* Mid-session rebuild detection: if a re-fetch returns a digest that
-  differs from the previously-cached value for the same tag, the resolver
-  emits a ``WARNING`` log naming both digests so operators can spot
-  rebuilds during long-running workforces.
-
-Failure mode
-------------
-By default the resolver is fail-open: if the registry is unreachable,
-returns a 5xx, or auth fails, ``resolve()`` falls back to the original
-tag-based URI with a ``WARNING`` log.  Image pinning is a quality
-improvement, not a correctness invariant — don't break hiring because the
-registry had a transient hiccup.  Pass ``fail_open=False`` to require
-successful resolution.
-
-Logging is terminal-only via the standard
-``ai4s.jobq.orchestration.image_resolver`` logger (no metrics emission).
+Only Azure Container Registry (``*.azurecr.io``) is supported.  Non-ACR
+images are returned unchanged with a warning log.
 """
 
 from __future__ import annotations
@@ -77,214 +22,80 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
-
-import requests
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
 
 LOG = logging.getLogger(__name__)
 
-# Default TTL — match the cadence of typical image rebuilds (weekly to monthly).
-# 1 hour means a long-running scheduler's workforce will see at most one
-# digest-change boundary per hour, well below the noise floor of normal
-# AML hiring activity.
 _DEFAULT_TTL_SECONDS = 3600
-
-# How long we wait on individual registry HTTP calls before falling back.
-# The manifest endpoint is normally <100 ms; 10 s is generous headroom.
-_HTTP_TIMEOUT_S = 10
-
-# Manifest media types accepted on the GET — covers Docker v2, OCI, and
-# multi-arch index variants.  Without this Accept header registries return
-# the v1 manifest by default which has a different (deprecated) digest.
-_MANIFEST_ACCEPT = (
-    "application/vnd.docker.distribution.manifest.v2+json,"
-    "application/vnd.oci.image.manifest.v1+json,"
-    "application/vnd.docker.distribution.manifest.list.v2+json,"
-    "application/vnd.oci.image.index.v1+json"
-)
-
-# AAD scope used by AcrAadAuth.  Per ACR docs, the AAD-to-ACR exchange
-# accepts any AAD token whose audience the registry trusts; the ARM
-# management scope is the conventional choice.
-_AAD_SCOPE_FOR_ACR = "https://management.azure.com/.default"
-
-
-# ── Pluggable auth ───────────────────────────────────────────────────────────
-
-
-class RegistryAuth(Protocol):
-    """Strategy for obtaining a Bearer token to pull manifests from a registry.
-
-    Implementations should be cheap on the hot path (cache internally if
-    needed) and thread-safe (the resolver may call from multiple threads).
-    Return ``None`` to skip the ``Authorization`` header entirely (anonymous
-    access for public registries / public repos).
-    """
-
-    def get_pull_token(self, registry: str, repo: str) -> str | None:
-        """Return a Bearer token for ``repo`` on ``registry``, or ``None``."""
-        ...
-
-
-class AnonymousAuth:
-    """No authentication.  Works for public registries / public repos."""
-
-    def get_pull_token(self, registry: str, repo: str) -> str | None:
-        return None
-
-
-class BearerTokenAuth:
-    """Use a caller-supplied bearer token verbatim.
-
-    Useful for tests, for callers that obtain tokens out-of-band, or for
-    registries where token-acquisition logic doesn't fit a simple Protocol
-    method (the caller can refresh tokens on its own schedule and feed
-    them in).
-    """
-
-    def __init__(self, token: str):
-        self._token = token
-
-    def get_pull_token(self, registry: str, repo: str) -> str:
-        return self._token
-
-
-class AcrAadAuth:
-    """Azure Container Registry auth via Azure AD identity.
-
-    Uses ACR's standard two-step OAuth dance:
-
-      1. Acquire an AAD access token (any scope the registry trusts; we
-         use the ARM management scope by convention).
-      2. Exchange it at ``https://{registry}/oauth2/exchange`` for an ACR
-         refresh token.  The exchange POST includes ``tenant=`` (extracted
-         from the token's ``iss`` claim) — without it some tenants 401.
-      3. Exchange the refresh token at ``https://{registry}/oauth2/token``
-         for a repo-scoped pull access token.
-
-    The principal must have AcrPull (or stronger) on the registry.
-
-    Default credential: ``ChainedTokenCredential`` that tries
-    ``AzureCliCredential`` before ``DefaultAzureCredential``.  On Azure
-    VMs ``DefaultAzureCredential`` will pick the VM's managed identity
-    first, which often lacks AcrPull on the registry; preferring the CLI
-    login (i.e. the operator's interactive ``az login`` identity) keeps
-    things working on dev/op boxes.  Override ``credential`` for service
-    accounts in production.
-
-    Token responses are not cached here — the outer
-    :class:`ImageDigestResolver` cache typically prevents re-acquisition.
-    For very high call rates or registries with low quota, wrap or
-    subclass to add caching.
-    """
-
-    def __init__(self, credential: TokenCredential | None = None):
-        # Defer the import so non-ACR users don't pay the azure-identity
-        # import cost (or even need azure-identity installed).
-        if credential is None:
-            from azure.identity import (
-                AzureCliCredential,
-                ChainedTokenCredential,
-                DefaultAzureCredential,
-            )
-
-            # Prefer the operator's `az login` identity over any managed
-            # identity attached to the host (which often lacks AcrPull).
-            credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
-        self._credential: TokenCredential = credential
-
-    def get_pull_token(self, registry: str, repo: str) -> str:
-        aad_token = self._credential.get_token(_AAD_SCOPE_FOR_ACR).token
-        tenant_id = _tenant_from_jwt(aad_token)
-
-        exchange_resp = requests.post(
-            f"https://{registry}/oauth2/exchange",
-            data={
-                "grant_type": "access_token",
-                "service": registry,
-                "tenant": tenant_id,
-                "access_token": aad_token,
-            },
-            timeout=_HTTP_TIMEOUT_S,
-        )
-        exchange_resp.raise_for_status()
-        refresh_token: str = exchange_resp.json()["refresh_token"]
-
-        token_resp = requests.post(
-            f"https://{registry}/oauth2/token",
-            data={
-                "grant_type": "refresh_token",
-                "service": registry,
-                "scope": f"repository:{repo}:pull",
-                "refresh_token": refresh_token,
-            },
-            timeout=_HTTP_TIMEOUT_S,
-        )
-        token_resp.raise_for_status()
-        access_token: str = token_resp.json()["access_token"]
-        return access_token
-
-
-# ── Resolver ─────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class _CacheEntry:
-    """Cached digest resolution for a single image tag."""
-
     digest: str
     resolved_at_monotonic: float
 
 
 class ImageDigestResolver:
-    """Resolve ``registry/repo:tag`` references to ``registry/repo@sha256:...``.
+    """Resolve ``registry/repo:tag`` to ``registry/repo@sha256:...``.
 
-    Thread-safe: a single instance can be shared across all Workforces in a
-    MultiRegionWorkforce.  Use one resolver per scheduler process.
+    Thread-safe.  A single instance can be shared across all Workforces in
+    a MultiRegionWorkforce.
 
     Args:
+        credential: Azure ``TokenCredential`` used to authenticate against
+            ACR.  Defaults to ``ChainedTokenCredential(AzureCliCredential(),
+            DefaultAzureCredential())`` — matching the operator's interactive
+            login on dev boxes while falling back to managed identity in
+            production.
         ttl_seconds: How long a cached digest is reused before re-fetching.
-            Defaults to 1 h.  Set to 0 to disable caching (re-fetch every
-            call; useful for tests, costly in production).
         fail_open: When True (default), unresolvable images fall back to
-            the original tag-based URI with a WARNING.  Set to False to
-            require successful resolution (raises the underlying error).
-        auth: :class:`RegistryAuth` strategy.  Defaults to
-            :class:`AcrAadAuth` since the typical user is on AML + ACR.
-            Pass :class:`AnonymousAuth` for public registries, or a
-            custom implementation for Docker Hub / GHCR / etc.
+            the original tag-based URI.  Set to False to raise on failure.
     """
 
     def __init__(
         self,
+        credential: TokenCredential | None = None,
+        *,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
         fail_open: bool = True,
-        auth: RegistryAuth | None = None,
     ):
+        self._credential = credential or self._default_credential()
         self._ttl_seconds = ttl_seconds
         self._fail_open = fail_open
         self._cache: dict[str, _CacheEntry] = {}
         self._lock = threading.Lock()
-        self._auth: RegistryAuth = auth or AcrAadAuth()
+
+    @staticmethod
+    def _default_credential() -> TokenCredential:
+        from azure.identity import (
+            AzureCliCredential,
+            ChainedTokenCredential,
+            DefaultAzureCredential,
+        )
+
+        return ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
 
     def resolve(self, image_uri: str) -> str:
-        """Return ``image_uri`` rewritten with its content digest.
+        """Rewrite ``image_uri`` to use its content digest.
 
-        If ``image_uri`` already contains ``@sha256:``, it's returned
-        unchanged.  Otherwise the digest is fetched (or read from cache),
-        and a digest-pinned URI is returned.  On any error and with
-        ``fail_open=True``, the original ``image_uri`` is returned and a
-        WARNING is logged.
-
-        Examples:
-            ``"reg.azurecr.io/foo/bar:2026-04-21"`` ->
-            ``"reg.azurecr.io/foo/bar@sha256:abc123..."``.
+        Returns the URI unchanged if it is already digest-pinned, if the
+        registry is not ACR, or (with ``fail_open=True``) on any error.
         """
         if "@sha256:" in image_uri:
-            return image_uri  # already digest-pinned
+            return image_uri
+
+        registry, repo, tag = _parse_image_uri(image_uri)
+
+        if not registry.endswith(".azurecr.io"):
+            LOG.warning(
+                "image_digest_skip image=%s reason=non-ACR registry; "
+                "only *.azurecr.io is supported for digest pinning",
+                image_uri,
+            )
+            return image_uri
 
         with self._lock:
             entry = self._cache.get(image_uri)
@@ -293,7 +104,7 @@ class ImageDigestResolver:
                 return _format_digest_uri(image_uri, entry.digest)
 
             try:
-                digest = self._fetch_digest(image_uri)
+                digest = self._fetch_digest(registry, repo, tag)
             except Exception as exc:
                 LOG.warning(
                     "image_digest_resolution_failed image=%s error=%s; "
@@ -308,7 +119,6 @@ class ImageDigestResolver:
 
             previous_digest = entry.digest if entry is not None else None
             if previous_digest is not None and previous_digest != digest:
-                # Registry rebuild during a live scheduler session — ops-relevant.
                 LOG.warning(
                     "image_digest_changed image=%s old_digest=%s new_digest=%s "
                     "(image was re-pushed during scheduler session)",
@@ -324,39 +134,26 @@ class ImageDigestResolver:
                     self._ttl_seconds,
                 )
 
-            self._cache[image_uri] = _CacheEntry(
-                digest=digest,
-                resolved_at_monotonic=now,
-            )
+            self._cache[image_uri] = _CacheEntry(digest=digest, resolved_at_monotonic=now)
             return _format_digest_uri(image_uri, digest)
 
-    def _fetch_digest(self, image_uri: str) -> str:
-        """HTTP-fetch the manifest digest for a ``registry/repo:tag``."""
-        registry, repo, tag = _parse_image_uri(image_uri)
-        token = self._auth.get_pull_token(registry, repo)
+    def _fetch_digest(self, registry: str, repo: str, tag: str) -> str:
+        from azure.containerregistry import ContainerRegistryClient  # type: ignore[import-untyped]
 
-        headers = {"Accept": _MANIFEST_ACCEPT}
-        if token is not None:
-            headers["Authorization"] = f"Bearer {token}"
-
-        url = f"https://{registry}/v2/{repo}/manifests/{tag}"
-        resp = requests.get(url, headers=headers, timeout=_HTTP_TIMEOUT_S)
-        resp.raise_for_status()
-        digest: str | None = resp.headers.get("Docker-Content-Digest")
-        if not digest or not digest.startswith("sha256:"):
-            raise RuntimeError(
-                f"manifest GET returned no/invalid Docker-Content-Digest header "
-                f"(got: {digest!r}) for {image_uri}"
-            )
+        endpoint = f"https://{registry}"
+        with ContainerRegistryClient(endpoint, self._credential) as client:
+            props = client.get_manifest_properties(repo, tag)
+        digest: str = props.digest
+        if not digest.startswith("sha256:"):
+            raise RuntimeError(f"unexpected digest format from ACR: {digest!r}")
         return digest
 
 
 def _parse_image_uri(image_uri: str) -> tuple[str, str, str]:
     """Split ``registry/repo:tag`` into ``(registry, repo, tag)``.
 
-    The registry hostname is everything up to the first ``/``.  The tag
-    is everything after the final ``:`` *in the last path segment*; if
-    no ``:`` is present in the last segment, defaults to ``latest``.
+    Registry is everything before the first ``/``.  Tag is after the last
+    ``:`` in the final path segment; defaults to ``latest``.
     """
     if "/" not in image_uri:
         raise ValueError(f"image URI must include a registry hostname: {image_uri!r}")
@@ -377,35 +174,8 @@ def _parse_image_uri(image_uri: str) -> tuple[str, str, str]:
     return registry, repo, tag
 
 
-def _tenant_from_jwt(jwt_token: str) -> str:
-    """Decode an AAD access token and return the tenant id from ``iss``.
-
-    The ``iss`` claim is shaped like
-    ``https://sts.windows.net/{tenant_id}/``; we split and grab the path
-    segment.  We don't verify the signature — this is just for the
-    tenant_id field on the ACR exchange POST.
-    """
-    import base64
-    import json as _json
-
-    # JWT = header.payload.signature; we only need the payload.
-    try:
-        payload_b64 = jwt_token.split(".")[1]
-    except IndexError as e:
-        raise ValueError("malformed JWT (no payload segment)") from e
-    # base64url decode with padding fix-up
-    payload_b64 += "=" * (-len(payload_b64) % 4)
-    payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
-    iss: str = payload.get("iss", "")
-    parts = iss.rstrip("/").split("/")
-    if len(parts) < 4:
-        raise ValueError(f"unexpected iss format in AAD token: {iss!r}")
-    return parts[-1]
-
-
 def _format_digest_uri(image_uri: str, digest: str) -> str:
     """Rewrite ``registry/repo:tag`` to ``registry/repo@sha256:...``."""
-    # Strip the tag (everything after the last ':') from the last path segment.
     if "/" in image_uri:
         prefix, last_segment = image_uri.rsplit("/", 1)
         if ":" in last_segment:

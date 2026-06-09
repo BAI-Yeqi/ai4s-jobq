@@ -258,17 +258,7 @@ class Workforce:
         self._create_servicebus_resources()
         self.cluster_type: str | None = None
         self.session = requests.Session()
-        # Optional resolver that rewrites the prototype's image tag to a
-        # ``@sha256:...`` digest at hire-time so all workers in a session
-        # pull identical content.  See :mod:`image_resolver` for details.
         self._image_resolver = image_resolver
-        # Pre-registration of digest-pinned anonymous Environments. The
-        # AzureML SDK's ``jobs.create_or_update`` registers an inline
-        # Environment on every submission; concurrent submissions of the
-        # same content-hash version race on the workspace's
-        # ``CliV2AnonymousEnvironment/versions/<hash>`` PUT and the losers
-        # crash with ``ResourceExistsError``. Pre-registering once and
-        # substituting the returned ARM id avoids the race.
         self._env_register_lock = threading.Lock()
         self._registered_env_id_cache: dict[str, str] = {}
         t = self._credential.get_token("https://management.azure.com/.default")
@@ -582,30 +572,16 @@ class Workforce:
                 return
             raise
 
-    # Matches "version <hex>" embedded in the AzureML server-side
-    # ResourceExistsError message returned when a CliV2AnonymousEnvironment
-    # content-hash version is already registered. Used to recover the
-    # ARM id of the existing registration.
+    # Matches "version <hex>" in the AzureML ResourceExistsError message
+    # when a CliV2AnonymousEnvironment content-hash version already exists.
     _ENV_VERSION_RE = re.compile(r"version\s+([a-f0-9]{6,})")
 
     def _ensure_env_registered(self, env: Any) -> str:
         """Register an inline Environment once and return its ARM id.
 
-        Anonymous AML environments are content-hash-versioned. When the
-        image-digest resolver rewrites ``env.image`` to a ``@sha256:...``
-        URI, every ``_build_worker`` call produces a fresh
-        ``Environment`` object with the same content hash but no ARM id
-        — and the SDK's ``jobs.create_or_update`` tries to register it
-        on every submission. Concurrent submissions race; the losers
-        receive ``ResourceExistsError``.
-
-        Pre-registering once (under :attr:`_env_register_lock`) and
-        substituting the returned ARM id for the inline Environment
-        avoids the race entirely — subsequent submissions reference an
-        already-registered env by string id and the SDK skips
-        registration. The cache key is the resolved image URI; when the
-        resolver TTL flips and a new digest comes in, a fresh entry is
-        registered.
+        Concurrent ``_build_worker`` calls that produce the same content-hash
+        environment would race on registration. Pre-registering once (under a
+        lock) and caching the ARM id avoids ``ResourceExistsError`` crashes.
         """
         image: str = env.image
         cached = self._registered_env_id_cache.get(image)
@@ -619,9 +595,6 @@ class Workforce:
                 registered = self._aml_client.environments.create_or_update(env)
                 arm_id: str | None = registered.id
             except ResourceExistsError as exc:
-                # Another concurrent caller (or a previous run) already
-                # registered the same content-hash version. Fetch its
-                # canonical ARM id rather than failing.
                 arm_id = self._lookup_existing_anonymous_env_id(exc)
             if arm_id is None:
                 raise RuntimeError(f"Registered environment for image {image} has no ARM id")
@@ -630,13 +603,7 @@ class Workforce:
             return arm_id
 
     def _lookup_existing_anonymous_env_id(self, exc: ResourceExistsError) -> str:
-        """Resolve an existing ``CliV2AnonymousEnvironment`` ARM id from
-        a ``ResourceExistsError`` message.
-
-        The error embeds the content-hash version (e.g. ``"... with
-        version 82f822ba... is already registered ..."``); we parse it
-        and ``GET`` the env to obtain the canonical ARM id.
-        """
+        """Resolve an existing anonymous env ARM id from a ResourceExistsError."""
         match = self._ENV_VERSION_RE.search(str(exc))
         if not match:
             raise RuntimeError(
@@ -662,11 +629,8 @@ class Workforce:
         enough — no other attribute is mutated per-worker.
 
         If an ``image_resolver`` is configured, the prototype's
-        ``environment.image`` tag is rewritten to a content-digest URI so
-        all hires within the resolver's TTL window pull identical bytes
-        (see :mod:`image_resolver`).  The prototype's Environment is not
-        mutated — a shallow copy is taken so concurrent ``_build_worker``
-        calls don't race.
+        ``environment.image`` is rewritten to a ``@sha256:...`` digest so
+        all workers within the TTL window pull identical bytes.
         """
         job = copy.copy(self._job)
         # Give the copy its own env dict so parallel workers don't race on setdefault.
@@ -678,19 +642,6 @@ class Workforce:
         random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         job.name = f"{self._experiment_name}-{random_id}"
 
-        # Image-digest pinning: rewrite ``image:tag`` to ``image@sha256:...``
-        # if a resolver is configured and the prototype carries an
-        # Environment with a string image attribute.  String-named
-        # registered AML environments (e.g. ``"AzureML-PyTorch-1.10:1"``)
-        # don't have ``.image`` and are skipped.
-        #
-        # The rewritten Environment is pre-registered (once per resolved
-        # digest, under a thread lock) and ``job.environment`` is set to
-        # the registered ARM id *string* — not the Environment object.
-        # Passing a string env makes the SDK's ``create_or_update`` skip
-        # its per-submission registration step, which would otherwise
-        # race across concurrent ``parallel_hire`` threads and crash with
-        # ``ResourceExistsError``.
         if self._image_resolver is not None:
             env = job.environment
             original_image = getattr(env, "image", None)

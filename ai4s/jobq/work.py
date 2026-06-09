@@ -18,8 +18,9 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, ExitStack, s
 from functools import partial
 from multiprocessing import get_context
 from queue import Empty
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, gettempdir
 from typing import ClassVar
+from uuid import uuid4
 
 from rich.progress import TextColumn
 
@@ -82,7 +83,16 @@ else:
 def _env_wrapper(
     func: ty.Callable[[], ResultType],
     env: dict[str, str] | None = None,
-) -> ResultType:
+    pid_file: str | None = None,
+    cancel_file: str | None = None,
+) -> ResultType | None:
+    # Report PID so parent can signal us on cancellation (lock loss)
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+    # If task was cancelled before we started, bail out
+    if cancel_file and os.path.exists(cancel_file):
+        return None
     if env:
         for k, v in env.items():
             if not isinstance(v, str):
@@ -198,7 +208,21 @@ async def run_cmd_and_log_outputs(
                 process.pid,
             )
 
+    def handle_hard_kill_signal(*args):
+        nonlocal terminated
+        # Lock lost — no point in graceful shutdown, kill the entire process group immediately.
+        log(
+            logging.INFO,
+            "Lock lost: sending SIGKILL to process group %d from pool process %d",
+            process.pid,
+            os.getpid(),
+        )
+        terminated = True
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+
     signal.signal(signal.SIGUSR1, handle_shutdown_signal)
+    signal.signal(signal.SIGUSR2, handle_hard_kill_signal)
 
     # read child's stdout/stderr concurrently
     stdout = process.stdout
@@ -469,6 +493,8 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
         loop = asyncio.get_running_loop()
 
         env = env or {}
+        pid_file = os.path.join(gettempdir(), f"jobq_pid_{uuid4().hex}")
+        cancel_file = os.path.join(gettempdir(), f"jobq_cancel_{uuid4().hex}")
 
         with ExitStack() as stack:
             if bg_dirsync_to:
@@ -488,12 +514,42 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
                 env["AMLT_DIRSYNC_DIR"] = tmpdir
 
             try:
-                ret = await loop.run_in_executor(self._pool, partial(_env_wrapper, func, env=env))
+                ret = await loop.run_in_executor(
+                    self._pool,
+                    partial(
+                        _env_wrapper, func, env=env, pid_file=pid_file, cancel_file=cancel_file
+                    ),
+                )
             except asyncio.CancelledError:
+                # Task cancelled (e.g. lock lost) — kill the specific pool child's subprocess.
+                # Write cancel_file to prevent execution if the task hasn't started yet.
+                with open(cancel_file, "w") as f:
+                    f.write("cancelled")
+                try:
+                    with open(pid_file) as f:
+                        pid = int(f.read().strip())
+                    # JOBQ_LOCK_LOST_BEHAVIOR controls the signal sent on lock loss:
+                    #   "sigkill" (default) — SIGUSR2 → SIGKILL to process group (immediate)
+                    #   "sigterm" — SIGUSR1 → SIGTERM to subprocess (allows graceful cleanup)
+                    behavior = os.environ.get("JOBQ_LOCK_LOST_BEHAVIOR", "sigkill").lower()
+                    if behavior == "sigterm":
+                        os.kill(pid, signal.SIGUSR1)
+                        LOG.info("Sent SIGUSR1 (SIGTERM) to pool child %d (lock lost).", pid)
+                    else:
+                        os.kill(pid, signal.SIGUSR2)
+                        LOG.info("Sent SIGUSR2 (SIGKILL) to pool child %d (lock lost).", pid)
+                except FileNotFoundError:
+                    LOG.debug("pid_file not found — task may not have started yet.")
+                except (ValueError, ProcessLookupError):
+                    pass
                 raise
+            finally:
+                for path in (pid_file, cancel_file):
+                    with suppress(FileNotFoundError):
+                        os.unlink(path)
             if self._in_shutdown:
                 raise WorkerCanceled
-        return ret
+        return ty.cast("ResultType", ret)
 
     async def kill_all_subprocesses(self) -> None:
         """Coordinated shutdown: signal all pool children and wait for the pool to drain."""
@@ -535,6 +591,9 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
                         )
                     except Empty:
                         continue
+                    except (BrokenPipeError, ConnectionResetError, EOFError):
+                        LOG.debug("Log message queue connection lost (manager shut down).")
+                        break
                     except Exception:
                         LOG.exception("Error in logging message queue.")
                         continue

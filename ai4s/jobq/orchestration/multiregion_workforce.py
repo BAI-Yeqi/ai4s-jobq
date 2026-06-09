@@ -98,12 +98,8 @@ class MultiRegionWorkforce:
                 ``parallel_lay_off`` writer bursts remain outer-sequential to
                 avoid amplifying MFE write pressure (each already runs an
                 8-thread inner pool per region). Defaults to False.
-            image_resolver: Optional :class:`ImageDigestResolver`.  If
-                provided, it is installed on every child workforce so all
-                regions share one digest cache.  This pins each hire to
-                the same content-addressed image even if the underlying
-                tag is re-pushed mid-session, keeping the fleet
-                reproducible.  See :mod:`image_resolver` for details.
+            image_resolver: Optional :class:`ImageDigestResolver`.  Shared
+                across all child workforces so the digest cache is centralized.
         """
         self.workforces = workforces
         self.num_workers = num_workers
@@ -114,8 +110,6 @@ class MultiRegionWorkforce:
         self.use_lazy_states = use_lazy_states
         self.image_resolver = image_resolver
         if image_resolver is not None:
-            # Share one resolver across all regions so the cache (and the
-            # log of digest changes) is centralized.
             for wf in self.workforces:
                 wf.set_image_resolver(image_resolver)
         # When True, hires are dispatched via

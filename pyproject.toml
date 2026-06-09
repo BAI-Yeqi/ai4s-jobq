@@ -54,7 +54,7 @@ dev = [
     "sphinx_markdown_builder",
 ]
 workforce = [
-    "azure-ai-ml", "pydantic",
+    "azure-ai-ml", "pydantic", "azure-containerregistry",
 ]
 track = [
   "dash_bootstrap_components",
@@ -203,6 +203,7 @@ ignore = [
   "S602",    # subprocess shell — needed for shell commands
   "S607",    # partial path — intentional for user commands
   "ASYNC220",# subprocess in async — by design
+  "ASYNC230",# blocking open in async — tiny PID file reads in cancellation path
 ]
 "ai4s/jobq/orchestration/**/*.py" = [
   "S603", "S602", "S607",  # subprocess — orchestration runs commands
