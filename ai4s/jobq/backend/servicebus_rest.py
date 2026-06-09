@@ -39,11 +39,17 @@ _RETRYABLE_STATUS_CODES = frozenset({401, 408, 429, 500, 502, 503, 504})
 
 
 class _CachedTokenCredential:
-    """Wraps an AsyncTokenCredential and caches the access token, refreshing 60s before expiry."""
+    """Wraps an AsyncTokenCredential and caches the access token, refreshing 60s before expiry.
+
+    Uses an asyncio.Lock to prevent multiple concurrent refresh attempts
+    (thundering herd) when the token expires and several lock-renewal
+    coroutines request a new token simultaneously.
+    """
 
     def __init__(self, credential: AsyncTokenCredential):
         self.credential = credential
         self.token: AccessToken | None = None
+        self._refresh_lock = asyncio.Lock()
 
     async def __aenter__(self) -> "_CachedTokenCredential":
         return self
@@ -52,9 +58,25 @@ class _CachedTokenCredential:
         pass
 
     async def get_token(self) -> str:
-        if self.token is None or time.time() > self.token.expires_on - 60:
-            self.token = await self.credential.get_token(SERVICE_BUS_SCOPE)
-        return self.token.token
+        if self.token is not None and time.time() <= self.token.expires_on - 60:
+            return self.token.token
+
+        async with self._refresh_lock:
+            # Double-check after acquiring lock — another coroutine may have refreshed.
+            if self.token is not None and time.time() <= self.token.expires_on - 60:
+                return self.token.token
+            try:
+                self.token = await self.credential.get_token(SERVICE_BUS_SCOPE)
+            except Exception as exc:
+                if "transport" in str(exc).lower() and "closed" in str(exc).lower():
+                    LOG.error(
+                        "Credential HTTP transport is closed — token refresh impossible. "
+                        "This typically means the credential's async context manager was "
+                        "exited while still in use. Error: %s",
+                        exc,
+                    )
+                raise
+            return self.token.token
 
 
 def _parse_lock_duration(broker_props: dict) -> float:
@@ -687,7 +709,7 @@ class ServiceBusRestBackend(JobQBackend):
                             if stop_event.is_set():
                                 return
                             if retry_attempt < max_fast_retries:
-                                LOG.debug(
+                                LOG.info(
                                     "Transient renewal failure for message %s "
                                     "(attempt %d/%d): %s — retrying immediately",
                                     message.message_id,
@@ -706,7 +728,7 @@ class ServiceBusRestBackend(JobQBackend):
                             if stop_event.is_set():
                                 return
                             if retry_attempt < max_fast_retries:
-                                LOG.debug(
+                                LOG.info(
                                     "Transient renewal failure for message %s "
                                     "(attempt %d/%d) — retrying immediately",
                                     message.message_id,
@@ -785,7 +807,7 @@ class ServiceBusRestBackend(JobQBackend):
         if with_heartbeat:
             # Renew at half the actual lock duration reported by Service Bus,
             # NOT the application-level visibility_timeout which can be hours.
-            interval = max(message.lock_duration_seconds / 2, 5)
+            interval = max(message.lock_duration_seconds / 5, 5)
             lock_task, lock_stop_event = self._start_lock_renewal(
                 message, interval, lock_lost_event
             )
