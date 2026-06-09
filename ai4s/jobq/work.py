@@ -14,6 +14,7 @@ import typing as ty
 from abc import ABC, abstractmethod
 from asyncio.subprocess import PIPE
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, ExitStack, suppress
 from functools import partial
 from multiprocessing import get_context
@@ -432,6 +433,7 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
         self.__pool: ProcessPoolExecutor | None = None
         self._shutdown_lock = asyncio.Lock()
         self._in_shutdown = False
+        self._shutdown_event: asyncio.Event | None = None
         super().__init__()
 
     async def resume(self) -> None:
@@ -543,11 +545,22 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
                 except (ValueError, ProcessLookupError):
                     pass
                 raise
+            except BrokenProcessPool:
+                if self._shutdown_event is not None and self._shutdown_event.is_set():
+                    raise WorkerCanceled from None
+                raise
             finally:
                 for path in (pid_file, cancel_file):
                     with suppress(FileNotFoundError):
                         os.unlink(path)
             if self._in_shutdown:
+                raise WorkerCanceled
+            # If preemption was detected (shutdown_event set) but the active
+            # shutdown path hasn't reached us yet, treat a non-zero exit as a
+            # preemption-induced cancellation rather than a genuine failure.
+            # This closes the race where the subprocess exits before
+            # processor.shutdown() propagates the kill signal.
+            if ret != 0 and self._shutdown_event is not None and self._shutdown_event.is_set():
                 raise WorkerCanceled
         return ty.cast("ResultType", ret)
 
@@ -564,9 +577,13 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
             initializer=_process_pool_signal_handler,
         )
 
-    async def _wait_for_msg_queue_to_drain(self) -> None:
+    async def _wait_for_msg_queue_to_drain(self, timeout: float = 5.0) -> None:
         assert self.log_msg_queue is not None, "Log message queue not initialized"
+        deadline = time.monotonic() + timeout
         while not self.log_msg_queue.empty():
+            if time.monotonic() > deadline:
+                LOG.warning("Timed out waiting for log message queue to drain.")
+                break
             try:
                 await asyncio.sleep(0.1)
             except Exception:
@@ -619,11 +636,17 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
     async def __aexit__(self, *args: ty.Any) -> None:
         LOG.debug("Started ProcessPool context manager exit.")
         loop = asyncio.get_running_loop()
+        # 1. Shut down the pool — wait for all children to finish.  After this,
+        #    no more messages will be put() into the queue.
         await loop.run_in_executor(None, self._pool.shutdown, True)
+        # 2. Drain: let the consumer process all remaining messages before we
+        #    signal it to stop.  This prevents message loss on shutdown.
+        await self._wait_for_msg_queue_to_drain()
+        # 3. Send sentinel to stop the consumer task.
         LOG.debug("Signaling log msg queue to stop.")
         if self.log_msg_queue is not None:
-            # put a sentinel value to stop the log_from_queue task
             self.log_msg_queue.put(None)
+        # 4. Wait for the consumer task to exit.
         try:
             LOG.debug("Waiting for log queue task to finish.")
             await self._apq_task
@@ -631,6 +654,7 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
             pass
         finally:
             LOG.debug("Log queue task finished.")
+        # 5. Tear down infrastructure.
         ProcessPoolRegistry.remove_pool(self)
         self.log_msg_queue = None
         self.mp_manager.__exit__(*args)

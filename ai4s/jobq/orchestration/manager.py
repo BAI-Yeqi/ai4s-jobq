@@ -364,6 +364,11 @@ async def launch_workers(
         )
         await stack.enter_async_context(preemption_handler)
 
+        # Wire the shutdown event into the processor's pool so that tasks
+        # exiting during preemption are treated as cancellations, not failures.
+        if hasattr(processor, "pool") and hasattr(processor.pool, "_shutdown_event"):
+            processor.pool._shutdown_event = shutdown_event
+
         # those defaults are important, as they are the case of a preemption
         # the PreemptionEventHandler only sets the shutdown event but does not set the flags below
         flag_resume_if_not_killed = True
