@@ -54,7 +54,7 @@ dev = [
     "sphinx_markdown_builder",
 ]
 workforce = [
-    "azure-ai-ml", "pydantic",
+    "azure-ai-ml", "pydantic", "azure-containerregistry",
 ]
 track = [
   "dash_bootstrap_components",

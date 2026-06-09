@@ -4,10 +4,14 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import TYPE_CHECKING
 
 from ai4s.jobq import JobQ
 from ai4s.jobq.auth import get_token_credential
 from ai4s.jobq.orchestration.workforce import Workforce
+
+if TYPE_CHECKING:
+    from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
 
 LOG = logging.getLogger(__name__)
 
@@ -70,6 +74,7 @@ class MultiRegionWorkforce:
         use_lazy_states: bool = False,
         batched_delay_in_hiring: bool = True,
         parallel_region_reads: bool = False,
+        image_resolver: "ImageDigestResolver | None" = None,
     ):
         """
         Initialize the MultiRegionWorkforce.
@@ -93,6 +98,8 @@ class MultiRegionWorkforce:
                 ``parallel_lay_off`` writer bursts remain outer-sequential to
                 avoid amplifying MFE write pressure (each already runs an
                 8-thread inner pool per region). Defaults to False.
+            image_resolver: Optional :class:`ImageDigestResolver`.  Shared
+                across all child workforces so the digest cache is centralized.
         """
         self.workforces = workforces
         self.num_workers = num_workers
@@ -101,6 +108,10 @@ class MultiRegionWorkforce:
         self.credential = get_token_credential()
         self.max_num_workers = max_num_workers
         self.use_lazy_states = use_lazy_states
+        self.image_resolver = image_resolver
+        if image_resolver is not None:
+            for wf in self.workforces:
+                wf.set_image_resolver(image_resolver)
         # When True, hires are dispatched via
         # Workforce.parallel_hire_in_batches (batches of 512 with a 10 s
         # sleep between batches) instead of a single parallel_hire burst.

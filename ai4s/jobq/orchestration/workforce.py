@@ -34,21 +34,26 @@ import json
 import logging
 import os
 import random
+import re
 import string
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
 
 import jwt
 import requests
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Command
 from azure.core.credentials import TokenCredential
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import HttpResponseError, ResourceExistsError
 from dateutil.parser import parse as _parse_utc
 from pydantic import BaseModel, ConfigDict
 from rich.progress import (
@@ -237,6 +242,7 @@ class Workforce:
         servicebus_resource_group: str | None = None,
         servicebus_namespace: str | None = None,
         servicebus_topic: str | None = None,
+        image_resolver: "ImageDigestResolver | None" = None,
     ):
         self._job = worker_prototype
         self._experiment_name = experiment_name
@@ -252,10 +258,21 @@ class Workforce:
         self._create_servicebus_resources()
         self.cluster_type: str | None = None
         self.session = requests.Session()
+        self._image_resolver = image_resolver
+        self._env_register_lock = threading.Lock()
+        self._registered_env_id_cache: dict[str, str] = {}
         t = self._credential.get_token("https://management.azure.com/.default")
         self.tenant_id = jwt.decode(t.token, options={"verify_signature": False})["iss"].split("/")[
             3
         ]
+
+    def set_image_resolver(self, resolver: "ImageDigestResolver | None") -> None:
+        """Install (or clear) an image resolver after construction.
+
+        Used by :class:`MultiRegionWorkforce` to share one resolver across
+        all child workforces from a single point of configuration.
+        """
+        self._image_resolver = resolver
 
     def _create_servicebus_resources(self):
         """
@@ -555,6 +572,50 @@ class Workforce:
                 return
             raise
 
+    # Matches "version <hex>" in the AzureML ResourceExistsError message
+    # when a CliV2AnonymousEnvironment content-hash version already exists.
+    _ENV_VERSION_RE = re.compile(r"version\s+([a-f0-9]{6,})")
+
+    def _ensure_env_registered(self, env: Any) -> str:
+        """Register an inline Environment once and return its ARM id.
+
+        Concurrent ``_build_worker`` calls that produce the same content-hash
+        environment would race on registration. Pre-registering once (under a
+        lock) and caching the ARM id avoids ``ResourceExistsError`` crashes.
+        """
+        image: str = env.image
+        cached = self._registered_env_id_cache.get(image)
+        if cached is not None:
+            return cached
+        with self._env_register_lock:
+            cached = self._registered_env_id_cache.get(image)
+            if cached is not None:
+                return cached
+            try:
+                registered = self._aml_client.environments.create_or_update(env)
+                arm_id: str | None = registered.id
+            except ResourceExistsError as exc:
+                arm_id = self._lookup_existing_anonymous_env_id(exc)
+            if arm_id is None:
+                raise RuntimeError(f"Registered environment for image {image} has no ARM id")
+            self._registered_env_id_cache[image] = arm_id
+            LOG.info("anonymous_env_registered image=%s arm_id=%s", image, arm_id)
+            return arm_id
+
+    def _lookup_existing_anonymous_env_id(self, exc: ResourceExistsError) -> str:
+        """Resolve an existing anonymous env ARM id from a ResourceExistsError."""
+        match = self._ENV_VERSION_RE.search(str(exc))
+        if not match:
+            raise RuntimeError(
+                f"Could not parse environment version from ResourceExistsError: {exc}"
+            ) from exc
+        version = match.group(1)
+        registered = self._aml_client.environments.get("CliV2AnonymousEnvironment", version=version)
+        arm_id: str | None = registered.id
+        if arm_id is None:
+            raise RuntimeError(f"Fetched env CliV2AnonymousEnvironment:{version} has no ARM id")
+        return arm_id
+
     def _build_worker(self) -> Command:
         """Build a fresh worker job from the prototype, with a unique name.
 
@@ -566,6 +627,10 @@ class Workforce:
         previous implementation: ``InputsAttrDict`` is not deep-copyable),
         but shallow copy plus a fresh ``environment_variables`` dict is
         enough — no other attribute is mutated per-worker.
+
+        If an ``image_resolver`` is configured, the prototype's
+        ``environment.image`` is rewritten to a ``@sha256:...`` digest so
+        all workers within the TTL window pull identical bytes.
         """
         job = copy.copy(self._job)
         # Give the copy its own env dict so parallel workers don't race on setdefault.
@@ -576,6 +641,17 @@ class Workforce:
         job.experiment_name = self._experiment_name
         random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         job.name = f"{self._experiment_name}-{random_id}"
+
+        if self._image_resolver is not None:
+            env = job.environment
+            original_image = getattr(env, "image", None)
+            if original_image:
+                resolved = self._image_resolver.resolve(original_image)
+                if resolved != original_image:
+                    new_env = copy.copy(env)
+                    new_env.image = resolved
+                    job.environment = self._ensure_env_registered(new_env)
+
         return job
 
     def _run_parallel(
