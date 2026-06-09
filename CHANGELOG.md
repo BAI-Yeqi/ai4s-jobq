@@ -1,6 +1,36 @@
 CHANGELOG
 =========
 
+3.12.3 (2026-06-09)
+-------------------
+
+Fixes:
+
+* **Prevent synchronized lock-loss from shared credential transport closure.**
+  ``get_token_credential()`` was decorated with ``@lru_cache``, returning
+  the same credential instance to all callers in a process. When the
+  workforce monitor exited its async context manager, it permanently closed
+  the shared HTTP transport—causing all workers to lose their Service Bus
+  locks simultaneously. Each call site now receives an independent credential
+  instance.
+
+* **Avoid preemption race that decremented retry count.**
+  When a subprocess exited non-zero during preemption (for example, after
+  checkpointing and raising), the task's retry count was incorrectly
+  decremented. The manager now preserves the retry count when the exit
+  coincides with a pending preemption signal.
+
+CI:
+
+* **SHA-pin all GitHub Actions and add Dependabot for actions.**
+  Every workflow now uses full commit SHAs instead of mutable tags,
+  preventing supply chain attacks via tag rewriting. Dependabot is
+  configured to propose updates weekly.
+
+* **Verify requirements-ci.lock freshness in CI.**
+  A new lint step regenerates the lock file and fails if it drifts from
+  ``pyproject.toml``. A matching pre-commit hook auto-regenerates locally.
+
 3.12.2 (2026-05-27)
 -------------------
 

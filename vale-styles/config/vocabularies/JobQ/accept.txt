@@ -23,6 +23,7 @@ UUID[s]?
 [Dd]atetimes?
 [Dd]eduplicate
 [Dd]eduplication
+[Dd]ependabot
 [Dd]equeue
 [Dd]equeuing
 [Dd]eserializ(e|ation)
@@ -65,6 +66,7 @@ UUID[s]?
 [Ss]calability
 [Ss]erializ(e|ation)
 [Ss]ervicebus
+SHAs?
 [Ss]ubcommands?
 [Ss]ubprocess(es)?
 [Ss]ubprocesses?

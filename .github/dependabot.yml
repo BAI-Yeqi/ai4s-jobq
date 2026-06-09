@@ -1,0 +1,35 @@
+# Dependabot configuration for automated dependency updates and CVE monitoring.
+# See: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # GitHub Actions — keep SHA-pinned actions up to date
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+
+  # Python (pip) — monitor for CVEs in runtime and dev dependencies
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+
+  # npm — dev dependencies (azurite, pa11y, puppeteer)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+
+  # Docker — base image updates
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"

@@ -1,14 +1,22 @@
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
     hooks:
     -   id: check-yaml
     -   id: check-added-large-files
         args: [--maxkb=500]
     -   id: check-merge-conflict
     -   id: detect-private-key
+-   repo: https://github.com/jazzband/pip-tools
+    rev: a57e31229427e727c6f8dbf8acdef162182c6931  # v7.5.3
+    hooks:
+      - id: pip-compile
+        name: pip-compile (CI lock)
+        args: [--extra=dev, --generate-hashes, --output-file=requirements-ci.lock, --strip-extras, pyproject.toml]
+        files: ^pyproject\.toml$
+        additional_dependencies: []
 -   repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.20.1
+    rev: 0f369d245750787ce34997d464ed9605391a5283  # v1.20.1
     hooks:
       - id: mypy
         types: [python]
@@ -20,21 +28,21 @@ repos:
         args:
           - --no-namespace-packages
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.6
+    rev: fa1ed65ba95bfa7771a71003a9d74402541f5a5c  # v0.14.6
     hooks:
       - id: ruff
         args: [--fix]
       - id: ruff-format
 -   repo: https://github.com/PyCQA/doc8
-    rev: v1.1.2
+    rev: d66cb70cb8fcb9dbc7f8d3192f38403e1d46b7c3  # v1.1.2
     hooks:
       - id: doc8
 -   repo: https://github.com/igorshubovych/markdownlint-cli
-    rev: v0.44.0
+    rev: 586c3ea3f51230da42bab657c6a32e9e66c364f0  # v0.44.0
     hooks:
       - id: markdownlint
 -   repo: https://github.com/errata-ai/vale
-    rev: v3.13.0
+    rev: 27593b0e0e7eb8f0c2b7fae0d93fa1cfaabceb2f  # v3.13.0
     hooks:
       - id: vale
         args: [--minAlertLevel, error]
