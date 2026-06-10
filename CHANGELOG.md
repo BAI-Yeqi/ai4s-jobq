@@ -1,6 +1,31 @@
 CHANGELOG
 =========
 
+3.13.0 (2026-06-10)
+-------------------
+
+Features:
+
+* **Pin ACR image tags to content digests at hire time.**
+  New ``ImageDigestResolver`` (``ai4s.jobq.orchestration.image_resolver``)
+  resolves a ``registry/repo:tag`` reference to its immutable
+  ``registry/repo@sha256:...`` digest via the ``azure-containerregistry``
+  SDK and caches it under a TTL. ``Workforce`` and ``MultiRegionWorkforce``
+  take an optional ``image_resolver`` and rewrite ``env.image`` at hire
+  time, so every worker in a scheduler session pulls byte-identical image
+  content even if the tag is re-pushed mid-run. Opt-in, ACR-only
+  (``*.azurecr.io``), fail-open on registry errors. Adds an
+  ``azure-containerregistry`` dependency. (#73)
+
+Fixes:
+
+* **Avoid a registration race on digest-pinned anonymous environments.**
+  When the resolver rewrites ``env.image``, concurrent ``_build_worker``
+  calls produce the same content-hash anonymous AzureML environment and
+  race on registration, failing with ``ResourceExistsError``. The Workforce
+  now pre-registers the environment once under a lock, caches its ARM id,
+  and submits jobs against that id. (#73)
+
 3.12.3 (2026-06-09)
 -------------------
 
