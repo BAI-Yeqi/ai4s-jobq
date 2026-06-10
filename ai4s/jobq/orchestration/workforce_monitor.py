@@ -62,12 +62,21 @@ async def workforce_monitor(worker_id: str, queue_name: str) -> ty.AsyncGenerato
                 SUBSCRIPTION_NAME,
             )
 
+            backoff_seconds = 0.0
             while True:
                 try:
+                    if backoff_seconds > 0:
+                        LOG.info(
+                            "Backing off %.1f seconds before retrying",
+                            backoff_seconds,
+                        )
+                        await asyncio.sleep(backoff_seconds)
+
                     received_messages = await receiver.receive_messages(
                         max_message_count=1,
                         max_wait_time=None,
                     )
+                    backoff_seconds = 0.0
                     message = received_messages[0]
                     message_dict = json.loads(str(message))
                     if message_dict["operation"] == "do-not-accept-new-tasks":
@@ -86,10 +95,17 @@ async def workforce_monitor(worker_id: str, queue_name: str) -> ty.AsyncGenerato
                         break
                 except asyncio.CancelledError:
                     break
-                except Exception:
+                except json.JSONDecodeError:
                     LOG.exception(
                         "Could not json-decode message from topic %r",
                         WORKFORCE_CONTROL_TOPIC_NAME,
+                    )
+                except Exception:
+                    backoff_seconds = min(backoff_seconds * 2 or 1.0, 60.0)
+                    LOG.exception(
+                        "Error receiving message from topic %r, retrying in %.1fs",
+                        WORKFORCE_CONTROL_TOPIC_NAME,
+                        backoff_seconds,
                     )
 
     task = asyncio.create_task(
