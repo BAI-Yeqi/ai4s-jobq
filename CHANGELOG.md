@@ -1,6 +1,18 @@
 CHANGELOG
 =========
 
+3.13.1 (2026-06-10)
+-------------------
+
+Fixes:
+
+* **Workforce monitor: separate JSON-decode errors from transient transport failures.**
+  The monitor's exception handler logged every error (including
+  ``ServiceBusServerBusyError``) as "Could not json-decode message" and retried
+  immediately, tight-looping under throttling. ``json.JSONDecodeError`` now has
+  its own accurate handler, and all other exceptions are retried with an
+  exponential delay (capped at one minute, reset after a successful receive). (#93)
+
 3.13.0 (2026-06-10)
 -------------------
 
