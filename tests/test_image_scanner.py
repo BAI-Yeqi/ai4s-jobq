@@ -146,6 +146,11 @@ def _fake_fedramp_module(find_vulns: MagicMock) -> types.ModuleType:
     mod.ScanMode = ScanMode  # type: ignore[attr-defined]
     mod.Severity = Severity  # type: ignore[attr-defined]
     mod.find_vulns = find_vulns  # type: ignore[attr-defined]
+
+    class DockerImageNoVulnerabilitiesFound(Exception):  # noqa: N818 - mirror real scanner name
+        """Raised by the real scanner when a clean image has no actionable vulns."""
+
+    mod.DockerImageNoVulnerabilitiesFound = DockerImageNoVulnerabilitiesFound  # type: ignore[attr-defined]
     return mod
 
 
@@ -246,3 +251,21 @@ def test_findings_counts_logged(monkeypatch: pytest.MonkeyPatch, caplog) -> None
         s.scan(_DIGEST_URI)
     assert "image_scan_findings" in caplog.text
     assert "blocking=0 suppressed=3" in caplog.text
+
+
+def test_no_vulnerabilities_found_is_clean_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The real fedramp-scanner RAISES DockerImageNoVulnerabilitiesFound on a clean
+    # image instead of returning empty lists; _run_scan must treat that as a PASS
+    # and stamp the version, not surface it as a scan error.
+    mod = _fake_fedramp_module(MagicMock())
+
+    def _raise(*_a, **_k):
+        raise mod.DockerImageNoVulnerabilitiesFound("no vulnerabilities requiring action")
+
+    mod.find_vulns = _raise  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "fedramp_scanner", mod)
+    monkeypatch.setattr(f"{_LOGGER}._scanner_version", lambda: "9.9.9")
+
+    # fail_open=False so a mis-handled clean case would raise instead of stamping.
+    s = _make_scanner(fail_open=False)
+    assert s.scan(_DIGEST_URI) == "9.9.9"

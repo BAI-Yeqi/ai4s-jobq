@@ -244,7 +244,13 @@ class ImageScanner:
     def _run_scan(self, image_uri: str, created_on: datetime | None) -> str:
         """Invoke ``fedramp_scanner.find_vulns``; raise on findings, else return the version."""
         try:
-            from fedramp_scanner import Image, ScanMode, Severity, find_vulns
+            from fedramp_scanner import (
+                DockerImageNoVulnerabilitiesFound,
+                Image,
+                ScanMode,
+                Severity,
+                find_vulns,
+            )
         except ImportError as exc:
             raise ImageScanError(
                 "fedramp-scanner is not installed; install the scan extra "
@@ -252,15 +258,23 @@ class ImageScanner:
             ) from exc
 
         image = Image.parse(image_uri)
-        vulns, not_a_problem = find_vulns(
-            self._subscription_ids,
-            image,
-            severity=Severity.from_str(self._severity),
-            credential=self._credential,
-            expected_job_duration=self._expected_job_duration_days,
-            created_on=created_on,
-            scan_mode=ScanMode.from_str(self._scan_mode),
-        )
+        try:
+            vulns, not_a_problem = find_vulns(
+                self._subscription_ids,
+                image,
+                severity=Severity.from_str(self._severity),
+                credential=self._credential,
+                expected_job_duration=self._expected_job_duration_days,
+                created_on=created_on,
+                scan_mode=ScanMode.from_str(self._scan_mode),
+            )
+        except DockerImageNoVulnerabilitiesFound:
+            # Clean image: the scanner ran and found nothing requiring action
+            # within the job duration. fedramp-scanner signals this by raising
+            # rather than returning empty lists -- it is a PASS, so stamp it.
+            LOG.debug("image_scan_findings image=%s blocking=0 (no vulnerabilities)", image_uri)
+            return _scanner_version()
+
         suppressed = sum(len(v) for v in not_a_problem.values()) if not_a_problem else 0
         LOG.debug(
             "image_scan_findings image=%s blocking=%d suppressed=%d",
