@@ -678,6 +678,12 @@ class Workforce:
                 if scan_version is not None:
                     job.properties = dict(job.properties or {})
                     job.properties[FEDRAMP_SCAN_VERSION_PROPERTY] = scan_version
+                    LOG.debug(
+                        "stamped job=%s %s=%s",
+                        job.name,
+                        FEDRAMP_SCAN_VERSION_PROPERTY,
+                        scan_version,
+                    )
 
         return job
 

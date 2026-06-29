@@ -12,6 +12,7 @@ read.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -109,16 +110,18 @@ class TestBuildWorkerScanning:
         proto.environment.image = "msrmoldyn.azurecr.io/vasp/vasp-cpu-env:tag"
         return proto
 
-    def test_clean_scan_stamps_property(self) -> None:
+    def test_clean_scan_stamps_property(self, caplog) -> None:
         scanner = MagicMock()
         scanner.scan.return_value = "12.13.0"
         wf = _bare_workforce(_image_scanner=scanner)
         wf._job = self._proto()
 
-        j = wf._build_worker()
+        with caplog.at_level(logging.DEBUG, logger="ai4s.jobq.orchestration.workforce"):
+            j = wf._build_worker()
 
         scanner.scan.assert_called_once_with("msrmoldyn.azurecr.io/vasp/vasp-cpu-env:tag")
         assert j.properties["fedramp.scan-version"] == "12.13.0"
+        assert "stamped job=" in caplog.text
 
     def test_no_scanner_leaves_properties_untouched(self) -> None:
         wf = _bare_workforce()  # _image_scanner is None

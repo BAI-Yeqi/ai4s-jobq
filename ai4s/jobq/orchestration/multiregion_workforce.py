@@ -120,6 +120,11 @@ class MultiRegionWorkforce:
                 wf.set_image_resolver(image_resolver)
         self.image_scanner = image_scanner
         if image_scanner is not None:
+            LOG.info(
+                "image scanning enabled across %d workforce(s): %r",
+                len(self.workforces),
+                image_scanner,
+            )
             for wf in self.workforces:
                 wf.set_image_scanner(image_scanner)
         # When True, hires are dispatched via

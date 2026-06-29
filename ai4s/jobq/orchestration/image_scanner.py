@@ -68,6 +68,29 @@ def _scanner_version() -> str:
         return "unknown"
 
 
+def _summarize_findings(findings: list, limit: int = 10) -> str:
+    """Compact, log-safe summary of blocking findings for DEBUG output.
+
+    Defensive on purpose: pulls the CVE/vuln id + severity + offending package
+    off a ``fedramp_scanner.VulnerabilityFinding`` when present, and falls back
+    to ``str(finding)`` for anything else, so it never raises inside a log call.
+    """
+    parts: list[str] = []
+    for f in findings[:limit]:
+        ident = getattr(f, "cveId", None) or getattr(f, "vulnId", None)
+        if ident is None:
+            parts.append(str(f))
+            continue
+        software = getattr(f, "software", None)
+        installed = getattr(f, "installedVersion", None)
+        package = f"{software}@{installed}" if software else None
+        detail = ", ".join(str(x) for x in (getattr(f, "severity", None), package) if x)
+        parts.append(f"{ident}({detail})" if detail else str(ident))
+    if len(findings) > limit:
+        parts.append(f"(+{len(findings) - limit} more)")
+    return "; ".join(parts)
+
+
 @dataclass(frozen=True)
 class _CacheEntry:
     version: str | None
@@ -122,6 +145,13 @@ class ImageScanner:
         self._cache: dict[str, _CacheEntry] = {}
         self._lock = threading.Lock()
 
+    def __repr__(self) -> str:
+        return (
+            f"ImageScanner(scan_mode={self._scan_mode!r}, severity={self._severity!r}, "
+            f"expected_job_duration_days={self._expected_job_duration_days}, "
+            f"ttl_seconds={self._ttl_seconds}, fail_open={self._fail_open})"
+        )
+
     def scan(self, image_uri: str, *, created_on: datetime | None = None) -> str | None:
         """Scan ``image_uri`` and return the ``fedramp-scanner`` version on a clean pass.
 
@@ -147,44 +177,82 @@ class ImageScanner:
             entry = self._cache.get(image_uri)
             now = time.monotonic()
             if entry is not None and (now - entry.resolved_at_monotonic) < self._ttl_seconds:
+                age_s = now - entry.resolved_at_monotonic
                 if entry.error is not None:
+                    LOG.debug(
+                        "image_scan_cache_hit image=%s verdict=reject age_s=%.0f", image_uri, age_s
+                    )
                     raise entry.error
+                LOG.debug(
+                    "image_scan_cache_hit image=%s verdict=clean age_s=%.0f fedramp_scan_version=%s",
+                    image_uri,
+                    age_s,
+                    entry.version,
+                )
                 return entry.version
 
+            LOG.info(
+                "image_scan_start image=%s scan_mode=%s severity=%s expected_job_duration_days=%d",
+                image_uri,
+                self._scan_mode,
+                self._severity,
+                self._expected_job_duration_days,
+            )
+            started = time.monotonic()
             try:
                 scan_version = self._run_scan(image_uri, created_on)
             except ImageVulnerableError as exc:
                 self._cache[image_uri] = _CacheEntry(None, exc, now)
                 LOG.error(
-                    "image_scan_vulnerable image=%s findings=%d; refusing submission",
+                    "image_scan_vulnerable image=%s findings=%d elapsed_s=%.1f; refusing submission",
                     image_uri,
                     len(exc.findings),
+                    time.monotonic() - started,
                 )
                 raise
             except Exception as exc:
+                elapsed_s = time.monotonic() - started
                 if self._fail_open:
                     LOG.warning(
-                        "image_scan_failed image=%s error=%s; fail-open, submitting without stamp",
+                        "image_scan_failed image=%s elapsed_s=%.1f error=%s; "
+                        "fail-open, submitting without stamp",
                         image_uri,
+                        elapsed_s,
                         exc,
                     )
                     self._cache[image_uri] = _CacheEntry(None, None, now)
                     return None
                 wrapped = ImageScanError(f"vulnerability scan failed for {image_uri}: {exc}")
                 self._cache[image_uri] = _CacheEntry(None, wrapped, now)
-                LOG.error("image_scan_failed image=%s error=%s; fail-closed", image_uri, exc)
+                LOG.error(
+                    "image_scan_failed image=%s elapsed_s=%.1f error=%s; fail-closed",
+                    image_uri,
+                    elapsed_s,
+                    exc,
+                )
                 raise wrapped from exc
 
             self._cache[image_uri] = _CacheEntry(scan_version, None, now)
-            LOG.info("image_scan_clean image=%s fedramp_scan_version=%s", image_uri, scan_version)
+            LOG.info(
+                "image_scan_clean image=%s fedramp_scan_version=%s elapsed_s=%.1f",
+                image_uri,
+                scan_version,
+                time.monotonic() - started,
+            )
             return scan_version
 
     def _run_scan(self, image_uri: str, created_on: datetime | None) -> str:
         """Invoke ``fedramp_scanner.find_vulns``; raise on findings, else return the version."""
-        from fedramp_scanner import Image, ScanMode, Severity, find_vulns
+        try:
+            from fedramp_scanner import Image, ScanMode, Severity, find_vulns
+        except ImportError as exc:
+            raise ImageScanError(
+                "fedramp-scanner is not installed; install the scan extra "
+                "(pip install 'ai4s-jobq[scan]') to enable image scanning"
+            ) from exc
 
         image = Image.parse(image_uri)
-        vulns, _not_a_problem = find_vulns(
+        vulns, not_a_problem = find_vulns(
             self._subscription_ids,
             image,
             severity=Severity.from_str(self._severity),
@@ -193,6 +261,18 @@ class ImageScanner:
             created_on=created_on,
             scan_mode=ScanMode.from_str(self._scan_mode),
         )
+        suppressed = sum(len(v) for v in not_a_problem.values()) if not_a_problem else 0
+        LOG.debug(
+            "image_scan_findings image=%s blocking=%d suppressed=%d",
+            image_uri,
+            len(vulns),
+            suppressed,
+        )
         if vulns:
+            LOG.debug(
+                "image_scan_blocking_findings image=%s findings=[%s]",
+                image_uri,
+                _summarize_findings(vulns),
+            )
             raise ImageVulnerableError(image_uri, vulns)
         return _scanner_version()
