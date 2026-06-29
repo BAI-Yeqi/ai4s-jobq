@@ -22,6 +22,7 @@ import pytest
 # environment).
 pytest.importorskip("azure.ai.ml")
 
+from ai4s.jobq.orchestration.image_scanner import ImageVulnerableError
 from ai4s.jobq.orchestration.workforce import AmlExperiment, AmlJob, Workforce
 
 
@@ -59,6 +60,7 @@ def _bare_workforce(**overrides) -> Workforce:
     wf._aml_client.resource_group_name = "rg"
     wf._aml_client.workspace_name = "ws"
     wf._image_resolver = None
+    wf._image_scanner = None
     wf._env_register_lock = threading.Lock()
     wf._registered_env_id_cache = {}
     for k, v in overrides.items():
@@ -94,6 +96,56 @@ class TestBuildWorker:
 
         j = wf._build_worker()
         assert j.environment_variables["APPLICATIONINSIGHTS_CONNECTION_STRING"] == "conn"
+
+
+class TestBuildWorkerScanning:
+    """`_build_worker` runs the image scanner and stamps the scan version."""
+
+    @staticmethod
+    def _proto() -> MagicMock:
+        proto = MagicMock()
+        proto.environment_variables = None
+        proto.properties = {}
+        proto.environment.image = "msrmoldyn.azurecr.io/vasp/vasp-cpu-env:tag"
+        return proto
+
+    def test_clean_scan_stamps_property(self) -> None:
+        scanner = MagicMock()
+        scanner.scan.return_value = "12.13.0"
+        wf = _bare_workforce(_image_scanner=scanner)
+        wf._job = self._proto()
+
+        j = wf._build_worker()
+
+        scanner.scan.assert_called_once_with("msrmoldyn.azurecr.io/vasp/vasp-cpu-env:tag")
+        assert j.properties["fedramp.scan-version"] == "12.13.0"
+
+    def test_no_scanner_leaves_properties_untouched(self) -> None:
+        wf = _bare_workforce()  # _image_scanner is None
+        wf._job = self._proto()
+
+        j = wf._build_worker()
+
+        assert "fedramp.scan-version" not in j.properties
+
+    def test_skipped_scan_does_not_stamp(self) -> None:
+        scanner = MagicMock()
+        scanner.scan.return_value = None  # e.g. non-ACR image, skipped
+        wf = _bare_workforce(_image_scanner=scanner)
+        wf._job = self._proto()
+
+        j = wf._build_worker()
+
+        assert "fedramp.scan-version" not in j.properties
+
+    def test_vulnerable_image_aborts_build(self) -> None:
+        scanner = MagicMock()
+        scanner.scan.side_effect = ImageVulnerableError("img", ["CVE-1"])
+        wf = _bare_workforce(_image_scanner=scanner)
+        wf._job = self._proto()
+
+        with pytest.raises(ImageVulnerableError):
+            wf._build_worker()
 
 
 class TestParallelHire:

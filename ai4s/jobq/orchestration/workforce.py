@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
+    from ai4s.jobq.orchestration.image_scanner import ImageScanner
 
 import jwt
 import requests
@@ -67,6 +68,8 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.text import Text
+
+from ai4s.jobq.orchestration.image_scanner import FEDRAMP_SCAN_VERSION_PROPERTY
 
 LOG = logging.getLogger(__name__)
 
@@ -243,6 +246,7 @@ class Workforce:
         servicebus_namespace: str | None = None,
         servicebus_topic: str | None = None,
         image_resolver: "ImageDigestResolver | None" = None,
+        image_scanner: "ImageScanner | None" = None,
     ):
         self._job = worker_prototype
         self._experiment_name = experiment_name
@@ -259,6 +263,7 @@ class Workforce:
         self.cluster_type: str | None = None
         self.session = requests.Session()
         self._image_resolver = image_resolver
+        self._image_scanner = image_scanner
         self._env_register_lock = threading.Lock()
         self._registered_env_id_cache: dict[str, str] = {}
         t = self._credential.get_token("https://management.azure.com/.default")
@@ -273,6 +278,14 @@ class Workforce:
         all child workforces from a single point of configuration.
         """
         self._image_resolver = resolver
+
+    def set_image_scanner(self, scanner: "ImageScanner | None") -> None:
+        """Install (or clear) an image scanner after construction.
+
+        Used by :class:`MultiRegionWorkforce` to share one scanner across all
+        child workforces from a single point of configuration.
+        """
+        self._image_scanner = scanner
 
     def _create_servicebus_resources(self):
         """
@@ -642,15 +655,29 @@ class Workforce:
         random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         job.name = f"{self._experiment_name}-{random_id}"
 
+        image_to_scan: str | None = None
         if self._image_resolver is not None:
             env = job.environment
             original_image = getattr(env, "image", None)
             if original_image:
                 resolved = self._image_resolver.resolve(original_image)
+                image_to_scan = resolved
                 if resolved != original_image:
                     new_env = copy.copy(env)
                     new_env.image = resolved
                     job.environment = self._ensure_env_registered(new_env)
+
+        # Scan the image that will actually run and stamp the scanner version so
+        # the alerting app can tell scanned jobs from never-scanned ones. A
+        # blocking finding raises out of the hire (the worker is not submitted).
+        if self._image_scanner is not None:
+            if image_to_scan is None:
+                image_to_scan = getattr(job.environment, "image", None)
+            if image_to_scan:
+                scan_version = self._image_scanner.scan(image_to_scan)
+                if scan_version is not None:
+                    job.properties = dict(job.properties or {})
+                    job.properties[FEDRAMP_SCAN_VERSION_PROPERTY] = scan_version
 
         return job
 

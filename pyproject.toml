@@ -56,6 +56,11 @@ dev = [
 workforce = [
     "azure-ai-ml", "pydantic", "azure-containerregistry",
 ]
+scan = [
+    # Standalone FedRAMP/vulnerability scanner. Optional: only required when a
+    # Workforce is constructed with an ImageScanner.
+    "fedramp-scanner",
+]
 track = [
   "dash_bootstrap_components",
   "dash",
@@ -90,6 +95,8 @@ module = [
   "dash.*",
   "opencensus.*",
   "ai4s.jobq.ext.amlt_utils",
+  "fedramp_scanner",
+  "fedramp_scanner.*",
   "azure.servicebus.*",
   "azure.data.tables.*",
   "azure.monitor.query.*",

@@ -12,6 +12,7 @@ from ai4s.jobq.orchestration.workforce import Workforce
 
 if TYPE_CHECKING:
     from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
+    from ai4s.jobq.orchestration.image_scanner import ImageScanner
 
 LOG = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class MultiRegionWorkforce:
         batched_delay_in_hiring: bool = True,
         parallel_region_reads: bool = False,
         image_resolver: "ImageDigestResolver | None" = None,
+        image_scanner: "ImageScanner | None" = None,
     ):
         """
         Initialize the MultiRegionWorkforce.
@@ -100,6 +102,10 @@ class MultiRegionWorkforce:
                 8-thread inner pool per region). Defaults to False.
             image_resolver: Optional :class:`ImageDigestResolver`.  Shared
                 across all child workforces so the digest cache is centralized.
+            image_scanner: Optional :class:`ImageScanner`.  Shared across all
+                child workforces so each image is scanned once; on a clean scan
+                the ``fedramp.scan-version`` property is stamped on every worker
+                job, and a blocking finding aborts the hire.
         """
         self.workforces = workforces
         self.num_workers = num_workers
@@ -112,6 +118,10 @@ class MultiRegionWorkforce:
         if image_resolver is not None:
             for wf in self.workforces:
                 wf.set_image_resolver(image_resolver)
+        self.image_scanner = image_scanner
+        if image_scanner is not None:
+            for wf in self.workforces:
+                wf.set_image_scanner(image_scanner)
         # When True, hires are dispatched via
         # Workforce.parallel_hire_in_batches (batches of 512 with a 10 s
         # sleep between batches) instead of a single parallel_hire burst.
