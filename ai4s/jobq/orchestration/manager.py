@@ -16,7 +16,7 @@ import aiohttp.client_exceptions
 import psutil
 import rich.progress
 from azure.core.exceptions import ServiceResponseError
-from rich.logging import RichHandler
+from rich.logging import RichHandler  # noqa: F401  # re-exported for back-compat
 from tenacity import RetryError
 
 try:
@@ -60,16 +60,10 @@ SeedType = ty.TypeVar("SeedType")
 
 
 def _get_rich_console() -> "rich.console.Console | None":
-    """Find the Console used by the active RichHandler, if any.
+    """Backward-compatible alias for :func:`ai4s.jobq.logging_utils.get_rich_console`."""
+    from ai4s.jobq.logging_utils import get_rich_console
 
-    Sharing this console with ``rich.progress.Progress`` ensures log messages
-    are properly interleaved with the live progress display instead of being
-    overwritten by it.
-    """
-    for handler in logging.root.handlers:
-        if isinstance(handler, RichHandler):
-            return handler.console
-    return None
+    return get_rich_console()
 
 
 try:
@@ -280,11 +274,13 @@ async def launch_workers(
     time_limit: timedelta = timedelta(days=1),
     visibility_timeout: timedelta = timedelta(hours=1),
     with_heartbeat: bool = True,
-    max_consecutive_failures: int = 10,
+    max_consecutive_failures: int = 50,
     num_workers: int = 1,
     show_progress: bool = True,
     worker_id: str | None = None,
     environment_name: str = "",
+    idle_timeout: timedelta | None = None,
+    max_idle_backoff: timedelta | None = None,
 ) -> None:
     """Launches multiple workers to pull and execute tasks from a queue.
 
@@ -299,9 +295,30 @@ async def launch_workers(
         show_progress: Show a progress bar while working.
         worker_id: A unique identifier for the worker. If None, a random id will be generated.
         environment_name: A string descriptor of the runtime environment, for example the cluster name, used for logging.
+        idle_timeout: If set, the worker will wait for new tasks instead of exiting
+            immediately when the queue is empty.  It retries with exponential
+            backoff (2 s → ``max_idle_backoff`` cap) and only exits after this
+            total duration elapses with no tasks received.  Useful for workflow
+            DAGs where the queue is transiently empty between task waves.
+        max_idle_backoff: Upper bound on the empty-queue exponential backoff
+            (defaults to 30 s).  Workflow DAG workloads where the coordinator
+            trickles tasks into the queue one at a time benefit from a much
+            smaller cap (e.g. 2 s) so all workers don't end up sleeping 30 s
+            between polls.  Only meaningful in combination with
+            ``idle_timeout``.
     """
     if worker_id is None:
         worker_id = uuid.uuid4().hex
+    max_idle_backoff_s = max_idle_backoff.total_seconds() if max_idle_backoff else 30.0
+    if max_idle_backoff_s < 1.0:
+        # The exponential schedule starts at 2 s; capping below 1 s would
+        # collapse the backoff to a tight loop.  Floor it so the worker
+        # still yields meaningfully between polls.
+        LOG.warning(
+            "max_idle_backoff=%.2fs is below the 1 s floor; clamping to 1 s.",
+            max_idle_backoff_s,
+        )
+        max_idle_backoff_s = 1.0
 
     set_custom_dimensions(worker_id=str(worker_id))
 
@@ -573,6 +590,8 @@ async def launch_workers(
             worker_id_for_task = f"{worker_id}:{idx}" if num_workers > 1 else str(worker_id)
             set_context_dimensions(worker_id=worker_id_for_task)
             num_consecutive_failures = 0
+            idle_deadline: datetime | None = None
+            idle_backoff = min(2.0, max_idle_backoff_s)
             soft_limit_time = datetime.now() + time_limit
             async with AsyncExitStack() as worker_stack:
                 if TRACE:
@@ -656,6 +675,10 @@ async def launch_workers(
                         assert worker_task in done, "Worker task should be done if we got here"
                         success = await worker_task
 
+                        # Reset idle timeout — we got a task
+                        idle_deadline = None
+                        idle_backoff = min(2.0, max_idle_backoff_s)
+
                         if show_progress:
                             progress.update(task_id, advance=1)
                         if success:
@@ -680,6 +703,20 @@ async def launch_workers(
                             continue
                         return
                     except EmptyQueue:
+                        if idle_timeout is not None:
+                            # Retry with exponential backoff until idle_timeout expires
+                            if idle_deadline is None:
+                                idle_deadline = datetime.now() + idle_timeout
+                                idle_backoff = min(2.0, max_idle_backoff_s)
+                            if datetime.now() < idle_deadline:
+                                LOG.debug(
+                                    "Worker %d: queue empty, retrying in %.0fs.",
+                                    idx,
+                                    idle_backoff,
+                                )
+                                await asyncio.sleep(idle_backoff)
+                                idle_backoff = min(idle_backoff * 2, max_idle_backoff_s)
+                                continue
                         LOG.info("Worker %d finished: Queue is empty.", idx)
                         return
                     finally:
@@ -690,19 +727,35 @@ async def launch_workers(
                             pass
 
         worker_tasks = [asyncio.create_task(worker(idx)) for idx in range(num_workers)]
+        # Track which workers exited via TooManyFailures so we can decide
+        # whether to fail the whole process.  Previously a single worker
+        # hitting its consecutive-failure cap cancelled all siblings —
+        # that's surprising at high concurrency where one unlucky failure
+        # streak ends a 60-worker pool.  Now siblings keep running and
+        # only if *every* worker exits via TooManyFailures do we surface
+        # the exception to the caller.
+        too_many_failures = 0
+        last_too_many: TooManyFailuresException | None = None
         for coro in asyncio.as_completed(worker_tasks):
             try:
                 await coro
             except asyncio.CancelledError:
                 pass
-            except TooManyFailuresException:
-                LOG.error("Too many consecutive failures. Canceling all workers.")
-                for task in worker_tasks:
-                    task.cancel()
-                for fut in asyncio.as_completed(worker_tasks, timeout=30):
-                    with suppress(asyncio.CancelledError):
-                        await fut
-                raise
+            except TooManyFailuresException as exc:
+                too_many_failures += 1
+                last_too_many = exc
+                LOG.warning(
+                    "Worker exited from too-many-failures (%d/%d so far); "
+                    "leaving siblings running.",
+                    too_many_failures,
+                    num_workers,
+                )
+        if too_many_failures == num_workers and last_too_many is not None:
+            LOG.error(
+                "All %d workers exited from too-many-failures; surfacing.",
+                num_workers,
+            )
+            raise last_too_many
 
 
 @asynccontextmanager

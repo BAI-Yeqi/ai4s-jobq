@@ -1,5 +1,5 @@
-Advanced Topics
-===============
+Operational topics
+==================
 
 .. toctree::
    :maxdepth: 2

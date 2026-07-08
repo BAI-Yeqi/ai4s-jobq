@@ -258,7 +258,8 @@ class ServiceBusRestClient:
             )
             # On 401, force token refresh and raise to trigger retry
             if resp.status == 401:
-                resp.close()
+                async with resp:
+                    pass
                 await self._force_token_refresh()
                 raise aiohttp.ClientResponseError(
                     request_info=resp.request_info,
@@ -289,7 +290,8 @@ class ServiceBusRestClient:
         }
 
         resp = await self._request("POST", url, headers=extra_headers, data=body)
-        resp.close()
+        async with resp:
+            resp.raise_for_status()
         return message_id
 
     async def peek_lock_message(self, timeout: int = 60) -> _ReceivedMessage:
@@ -300,8 +302,7 @@ class ServiceBusRestClient:
         # The SB data plane may briefly return 404 after queue operations;
         # retry a few times before giving up.
         for attempt in range(3):
-            resp = await self._request("POST", url, params=params)
-            try:
+            async with await self._request("POST", url, params=params) as resp:
                 if resp.status == 204:
                     raise EmptyQueue(f"The queue {self.fqns}/{self.queue_name} has no more tasks.")
                 if resp.status == 404:
@@ -313,8 +314,6 @@ class ServiceBusRestClient:
                 resp.raise_for_status()
                 body = await resp.text()
                 return _ReceivedMessage.from_response(resp, body)
-            finally:
-                resp.close()
         # Unreachable, but keeps mypy happy
         raise EmptyQueue(f"The queue {self.fqns}/{self.queue_name} has no more tasks.")
 
@@ -323,26 +322,21 @@ class ServiceBusRestClient:
         url = f"{self._base_url}/{self.queue_name}/messages/head"
         params = {"timeout": str(timeout)}
 
-        resp = await self._request("DELETE", url, params=params)
-        try:
+        async with await self._request("DELETE", url, params=params) as resp:
             if resp.status in (204, 404):
                 return None
             resp.raise_for_status()
             return await resp.text()
-        finally:
-            resp.close()
 
     async def complete_message(self, location_url: str) -> None:
         """Complete (delete) a previously peek-locked message using the Location URL."""
-        resp = await self._request("DELETE", location_url)
-        resp.raise_for_status()
-        resp.close()
+        async with await self._request("DELETE", location_url) as resp:
+            resp.raise_for_status()
 
     async def unlock_message(self, location_url: str) -> None:
         """Abandon (unlock) a previously peek-locked message, making it available again."""
-        resp = await self._request("PUT", location_url)
-        resp.raise_for_status()
-        resp.close()
+        async with await self._request("PUT", location_url) as resp:
+            resp.raise_for_status()
 
     async def deadletter_message(
         self,
@@ -414,13 +408,12 @@ class ServiceBusRestClient:
         Uses a single attempt (no tenacity retries) since the caller
         (_renew_loop) already retries on its own schedule.
         """
-        resp = await self._request("POST", location_url, timeout=timeout, max_retries=1)
-        try:
+        async with await self._request(
+            "POST", location_url, timeout=timeout, max_retries=1
+        ) as resp:
             resp.raise_for_status()
             broker_props = json.loads(resp.headers.get("BrokerProperties", "{}"))
             return _parse_lock_duration(broker_props)
-        finally:
-            resp.close()
 
     async def peek_messages(self, n: int = 1) -> list[dict]:
         """Non-destructive peek at messages (no lock acquired).
@@ -827,6 +820,86 @@ class ServiceBusRestBackend(JobQBackend):
         else:
             envelope = RESTServiceBusEnvelope(
                 message, task, self._rest_client, lock_task, lock_stop_event, lock_lost_event
+            )
+            try:
+                yield envelope
+            finally:
+                if lock_stop_event is not None:
+                    lock_stop_event.set()
+                if lock_task is not None and not lock_task.done():
+                    with suppress(asyncio.CancelledError):
+                        await lock_task
+
+    async def receive_messages_batch(
+        self,
+        max_messages: int,
+        visibility_timeout: timedelta,
+    ) -> list[_ReceivedMessage]:
+        """Receive up to *max_messages* via parallel peek-lock calls.
+
+        Returns raw ``_ReceivedMessage`` objects.  The caller wraps each
+        into an envelope via :meth:`wrap_message`.
+
+        Raises ``EmptyQueue`` if no messages are available.
+        """
+        assert self._rest_client is not None
+        rest_client = self._rest_client
+
+        async def _try_peek() -> _ReceivedMessage | None:
+            try:
+                return await rest_client.peek_lock_message(
+                    timeout=self._max_wait_time,
+                )
+            except EmptyQueue:
+                return None
+            except (TimeoutError, aiohttp.ClientError):
+                return None
+
+        results = await asyncio.gather(*[_try_peek() for _ in range(max_messages)])
+        messages = [m for m in results if m is not None]
+        if not messages:
+            raise EmptyQueue(f"The queue {self.name} has no more tasks.")
+        return messages
+
+    def wrap_message(
+        self,
+        message: _ReceivedMessage,
+        visibility_timeout: timedelta,
+        with_heartbeat: bool = False,
+    ) -> ty.AsyncContextManager[RESTServiceBusEnvelope]:
+        """Wrap a raw ``_ReceivedMessage`` into a heartbeat-managed envelope."""
+        return self._wrap_message_cm(message, with_heartbeat)
+
+    @asynccontextmanager
+    async def _wrap_message_cm(
+        self,
+        message: _ReceivedMessage,
+        with_heartbeat: bool,
+    ) -> ty.AsyncGenerator[RESTServiceBusEnvelope, None]:
+        assert self._rest_client is not None
+        rest_client = self._rest_client
+        lock_task: asyncio.Task[None] | None = None
+        lock_stop_event: asyncio.Event | None = None
+        lock_lost_event = asyncio.Event()
+        if with_heartbeat:
+            interval = max(message.lock_duration_seconds / 2, 5)
+            lock_task, lock_stop_event = self._start_lock_renewal(
+                message, interval, lock_lost_event
+            )
+
+        try:
+            task = Task.deserialize(message.body)
+        except Exception:
+            LOG.exception("Deserialization error in batch-received message — skipping.")
+            if lock_stop_event is not None:
+                lock_stop_event.set()
+            if lock_task is not None and not lock_task.done():
+                with suppress(asyncio.CancelledError):
+                    await lock_task
+            raise
+        else:
+            envelope = RESTServiceBusEnvelope(
+                message, task, rest_client, lock_task, lock_stop_event, lock_lost_event
             )
             try:
                 yield envelope

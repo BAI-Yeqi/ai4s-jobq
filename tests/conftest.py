@@ -1,11 +1,7 @@
-import os
-
 import pytest
 
 from ai4s.jobq import JobQ
-
-BLOB_PORT = os.environ.get("BLOB_PORT", "10000")
-QUEUE_PORT = os.environ.get("QUEUE_PORT", "10001")
+from ai4s.jobq.backend.storage_queue import azurite_conn_str
 
 
 def pytest_addoption(parser):
@@ -59,15 +55,9 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(skip_stress)
 
 
-CONNSTR = (
-    f"DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
-    f"QueueEndpoint=http://127.0.0.1:{QUEUE_PORT}/devstoreaccount1;"
-)
-
-
 @pytest.fixture
 async def azurite_connstr():
-    return CONNSTR
+    return azurite_conn_str()
 
 
 @pytest.fixture

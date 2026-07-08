@@ -28,6 +28,27 @@ You can query the logs in App Insights or the connected Log Analytics workspace 
 
    In Log Analytics (the service that App Insights uses under the hood), the names of the collections are slightly different, for example `AppTraces` instead of `Traces`.
 
+### Workflow logs
+
+When a worker runs a workflow task, every line of the user script's
+stdout and stderr is forwarded to Application Insights with two extra
+``customDimensions`` set: ``workflow_id`` and ``task_name``. This lets
+you scope a query to a single workflow without manually correlating
+task IDs:
+
+```text
+traces
+| where customDimensions.workflow_id == "abc-123"
+| where customDimensions.task_name == "train-gnn"
+| order by timestamp asc
+```
+
+The ``ai4s-jobq workflow logs <wf-id> [task]`` CLI prints a
+ready-to-paste version of this query (with a configurable
+``--since`` window). The dimensions are bound to each log message at
+emission time, so they remain correct even when many tasks run in
+parallel inside the same worker process.
+
 ### JobQ track
 
 The built-in dashboard provides a live view of queue activity, worker health,

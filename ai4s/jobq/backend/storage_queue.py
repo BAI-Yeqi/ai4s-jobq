@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 import asyncio
 import logging
+import os
 import time
 import typing as ty
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
@@ -19,6 +20,44 @@ from ai4s.jobq.entities import EmptyQueue, Response, Task
 from .common import Envelope, JobQBackend
 
 LOG = logging.getLogger(__name__)
+
+# Azurite's well-known account key (public, non-secret).
+_AZURITE_ACCOUNT_KEY = (
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+)
+
+
+def azurite_conn_str(
+    *,
+    queue_port: int | None = None,
+    service: str = "queue",
+    port: int | None = None,
+) -> str:
+    """Build the Azurite connection string for one of its services.
+
+    Args:
+        service: ``"queue"`` (default), ``"table"``, or ``"blob"``.
+        port: Override the default port. If unset, the corresponding
+            ``QUEUE_PORT``/``TABLE_PORT``/``BLOB_PORT`` env var is
+            consulted, then falls back to the standard Azurite port
+            (10001/10002/10000).
+        queue_port: Backwards-compatible alias for ``port`` when
+            ``service="queue"``. Prefer ``port=…`` in new code.
+    """
+    default_ports = {"queue": 10001, "table": 10002, "blob": 10000}
+    env_vars = {"queue": "QUEUE_PORT", "table": "TABLE_PORT", "blob": "BLOB_PORT"}
+    endpoints = {"queue": "QueueEndpoint", "table": "TableEndpoint", "blob": "BlobEndpoint"}
+    if service not in default_ports:
+        raise ValueError(f"Unknown service {service!r}; expected queue/table/blob")
+    chosen_port = (
+        port or queue_port or int(os.environ.get(env_vars[service], str(default_ports[service])))
+    )
+    return (
+        "DefaultEndpointsProtocol=http;"
+        "AccountName=devstoreaccount1;"
+        f"AccountKey={_AZURITE_ACCOUNT_KEY};"
+        f"{endpoints[service]}=http://127.0.0.1:{chosen_port}/devstoreaccount1;"
+    )
 
 
 class StorageQueueEnvelope(Envelope):
@@ -49,6 +88,19 @@ class StorageQueueEnvelope(Envelope):
     @property
     def lock_lost_event(self) -> asyncio.Event:
         return self._lock_lost_event
+
+    @property
+    def delivery_count(self) -> int:
+        """Number of times this message has been received from the queue.
+
+        Surfaces Azure Storage Queue's ``dequeue_count`` (1 on first
+        receipt, incremented on every subsequent redelivery) so the
+        workflow coordinator's stale-completion escape hatch
+        (REAPPLY / DROP thresholds) can fire on a wedged completion.
+        Returns ``0`` if the broker did not report a count (e.g. a
+        unit-test fixture or a peeked message).
+        """
+        return int(self.message.dequeue_count or 0)
 
     async def delete(self, success: bool, error: str | None = None) -> None:
         if not success:
@@ -90,6 +142,7 @@ class StorageQueueBackend(JobQBackend):
         storage_account: str | None = None,
         connection_string: str | None = None,
         credential: str | AsyncTokenCredential | None = None,
+        connection_pool_size: int | None = None,
     ):
         self.connection_string = connection_string
         self.storage_account = storage_account
@@ -97,6 +150,16 @@ class StorageQueueBackend(JobQBackend):
         self.queue_client: QueueClient | None = None
         self.dead_letter_queue_client: QueueClient | None = None
         self.credential = credential
+        # When set, override the per-client HTTP connection pool size
+        # (aiohttp ``TCPConnector(limit=...)``).  Defaults to the
+        # azure-core / aiohttp default of 100 concurrent connections.
+        # Bumping this can reduce per-call latency on a coordinator
+        # process that has many concurrent in-flight pushes against the
+        # same queue host; the value is read at __aenter__ and applied
+        # to both the main and dead-letter queue clients.
+        # Falls back to the ``JOBQ_HTTP_POOL_SIZE`` env var when not
+        # explicitly set.
+        self.connection_pool_size = connection_pool_size
 
         if self.queue_name == "my-unique-queue":
             raise ValueError("Don't be lazy and change the queue name to something unique.")
@@ -105,24 +168,37 @@ class StorageQueueBackend(JobQBackend):
     def dead_letter_queue_name(self) -> str:
         return f"{self.queue_name}-failed"
 
+    def _client_kwargs(self) -> dict[str, ty.Any]:
+        """Extra kwargs to inject into every ``QueueClient`` we create.
+
+        Used to thread the optional ``connection_pool_size`` override
+        through both the main and dead-letter clients without
+        duplicating the conditional.
+        """
+        from ai4s.jobq._http_transport import transport_kwargs_for_pool_size
+
+        return transport_kwargs_for_pool_size(self.connection_pool_size)
+
     async def __aenter__(self) -> "StorageQueueBackend":
         if self.connection_string:
             self.queue_client = QueueClient.from_connection_string(
-                self.connection_string, self.queue_name
+                self.connection_string, self.queue_name, **self._client_kwargs()
             )
             self.dead_letter_queue_client = QueueClient.from_connection_string(
-                self.connection_string, self.dead_letter_queue_name
+                self.connection_string, self.dead_letter_queue_name, **self._client_kwargs()
             )
         elif self.credential:
             self.queue_client = QueueClient(
                 account_url=f"https://{self.storage_account}.queue.core.windows.net",
                 queue_name=self.queue_name,
                 credential=self.credential,
+                **self._client_kwargs(),
             )
             self.dead_letter_queue_client = QueueClient(
                 account_url=f"https://{self.storage_account}.queue.core.windows.net",
                 queue_name=self.dead_letter_queue_name,
                 credential=self.credential,
+                **self._client_kwargs(),
             )
         else:
             raise ValueError("Either connection_string or credential must be provided.")
@@ -191,6 +267,91 @@ class StorageQueueBackend(JobQBackend):
             else:
                 yield StorageQueueEnvelope(
                     envelope,
+                    task,
+                    self,
+                    cancel_heartbeat_event,
+                    heartbeat_cancelled_event,
+                    lock_lost_event,
+                )
+
+    async def receive_messages_batch(
+        self,
+        max_messages: int,
+        visibility_timeout: timedelta,
+    ) -> list[QueueMessage]:
+        """Receive up to *max_messages* in a single HTTP call.
+
+        Returns raw ``QueueMessage`` objects (no heartbeat, no
+        deserialization).  The caller is responsible for wrapping each
+        into an ``Envelope`` via :meth:`receive_message` or equivalent.
+
+        Raises ``EmptyQueue`` if the queue has no visible messages.
+        """
+        assert self.queue_client is not None
+        vis = int(visibility_timeout.total_seconds())
+        messages: list[QueueMessage] = []
+        async for msg in self.queue_client.receive_messages(
+            messages_per_page=min(max_messages, 32),
+            visibility_timeout=vis,
+            max_messages=max_messages,
+        ):
+            messages.append(msg)
+            if len(messages) >= max_messages:
+                break
+        if not messages:
+            raise EmptyQueue(f"The queue {self.name} has no more tasks.")
+        return messages
+
+    def wrap_message(
+        self,
+        message: QueueMessage,
+        visibility_timeout: timedelta,
+        with_heartbeat: bool = False,
+    ) -> ty.AsyncContextManager["StorageQueueEnvelope"]:
+        """Wrap a raw ``QueueMessage`` into a heartbeat-managed envelope.
+
+        Use with messages obtained from :meth:`receive_messages_batch`.
+        Returns a context manager identical to :meth:`receive_message`.
+        """
+        return self._wrap_message_cm(message, visibility_timeout, with_heartbeat)
+
+    @asynccontextmanager
+    async def _wrap_message_cm(
+        self,
+        message: QueueMessage,
+        visibility_timeout: timedelta,
+        with_heartbeat: bool,
+    ) -> ty.AsyncGenerator[StorageQueueEnvelope, None]:
+        cancel_heartbeat_event = asyncio.Event()
+        heartbeat_cancelled_event = asyncio.Event()
+        lock_lost_event = asyncio.Event()
+        async with AsyncExitStack() as stack:
+            if with_heartbeat:
+                heartbeat_interval = visibility_timeout.total_seconds() / 2
+                assert heartbeat_interval > 0
+                await stack.enter_async_context(
+                    self._heartbeat_worker(
+                        message,
+                        interval=heartbeat_interval,
+                        visibility_timeout=visibility_timeout,
+                        cancel_heartbeat_event=cancel_heartbeat_event,
+                        heartbeat_cancelled_event=heartbeat_cancelled_event,
+                        lock_lost_event=lock_lost_event,
+                    )
+                )
+            else:
+                heartbeat_cancelled_event.set()
+
+            try:
+                task = Task.deserialize(message["content"])
+            except Exception:
+                LOG.exception(
+                    "Deserialization error in batch-received message — skipping.",
+                )
+                raise
+            else:
+                yield StorageQueueEnvelope(
+                    message,
                     task,
                     self,
                     cancel_heartbeat_event,
@@ -271,6 +432,19 @@ class StorageQueueBackend(JobQBackend):
             lock_duration = visibility_timeout.total_seconds()
             lock_lost_logged = False
             try:
+                # Wait *before* the first heartbeat.  Most messages
+                # complete well within the visibility timeout (often in
+                # tens of milliseconds), so an unconditional first
+                # update_message call would be a wasted round-trip on
+                # every receive — the message lease is already valid for
+                # the full ``visibility_timeout`` from the moment we
+                # received it.  We only need to renew if processing
+                # actually approaches the lease horizon.  Sleeping
+                # ``interval`` (= visibility_timeout / 2) here keeps the
+                # original safety margin (one heartbeat per half-window)
+                # without paying for messages that finish quickly.
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(cancel_heartbeat_event.wait(), interval)
                 while not cancel_heartbeat_event.is_set():
                     pop_receipt = message.pop_receipt
                     try:

@@ -15,20 +15,19 @@ repos:
         args: [--extra=dev, --generate-hashes, --output-file=requirements-ci.lock, --strip-extras, pyproject.toml]
         files: ^pyproject\.toml$
         additional_dependencies: []
--   repo: https://github.com/pre-commit/mirrors-mypy
-    rev: 0f369d245750787ce34997d464ed9605391a5283  # v1.20.1
+-   repo: local
     hooks:
       - id: mypy
+        name: mypy
+        entry: mypy --no-namespace-packages ai4s/
+        language: system
         types: [python]
-        # Only check source code, not tests (matches CI: `mypy ai4s/`)
+        # Only trigger when ai4s/ files change, but check the full tree
+        # so cross-module re-export and type errors are caught.
         files: ^ai4s/
-        # Install the package itself so mypy sees all runtime deps and their types.
-        additional_dependencies:
-          - ai4s-jobq[dev,track]
-        args:
-          - --no-namespace-packages
+        pass_filenames: false
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: fa1ed65ba95bfa7771a71003a9d74402541f5a5c  # v0.14.6
+    rev: v0.15.12
     hooks:
       - id: ruff
         args: [--fix]
@@ -47,3 +46,4 @@ repos:
       - id: vale
         args: [--minAlertLevel, error]
         types_or: [markdown, rst]
+        files: ^(docs/|README\.md|CONTRIBUTING\.md|SUPPORT\.md|SECURITY\.md|CODE_OF_CONDUCT\.md|CHANGELOG\.md)

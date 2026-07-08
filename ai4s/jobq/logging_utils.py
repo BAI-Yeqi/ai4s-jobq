@@ -19,10 +19,28 @@ from .auth import get_sync_token_credential
 
 if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
+    from rich.console import Console
 
 TASK_LOG = logging.getLogger("task")
 LOG = logging.getLogger("ai4s.jobq")
 TRACK_LOG = logging.getLogger("ai4s.jobq.track")
+
+
+def get_rich_console() -> "Console | None":
+    """Return the :class:`rich.console.Console` used by the active log handler.
+
+    Sharing this console with ``rich.progress.Progress`` (via its ``console=``
+    argument) ensures log records emitted while a Progress is live are
+    interleaved cleanly with the bar instead of clobbering it.
+
+    Returns ``None`` if no :class:`RichHandler` is attached to the root logger
+    (e.g. logging hasn't been set up, or output is being piped and the
+    :class:`PlainHandler` is in use).
+    """
+    for handler in logging.root.handlers:
+        if isinstance(handler, RichHandler):
+            return handler.console
+    return None
 
 
 def _azureml_run_description() -> dict[str, str]:
@@ -309,7 +327,14 @@ def setup_logging(
         custom_dims["environment"] = environment
     custom_dims.update(_pending_custom_dimensions)
     _pending_custom_dimensions.clear()
-    _custom_dimensions_filter = CustomDimensionsFilter(custom_dims)
+    # Logger-level filter — dimension-stamping only.  Logger filters
+    # mutate the record before any handler dispatch, so we must NOT
+    # strip ``exc_info`` here: doing so blows away the traceback before
+    # the rich/plain handlers can format it (e.g. for ``LOG.exception``
+    # at ``jobq.py:Failure for task X``).  The exception-stripping
+    # behaviour is the AppInsights-noise-suppression knob and belongs
+    # on the Azure Monitor handler exclusively (see below).
+    _custom_dimensions_filter = CustomDimensionsFilter(custom_dims, filter_exceptions=False)
     LOG.addFilter(_custom_dimensions_filter)
     TASK_LOG.addFilter(_custom_dimensions_filter)
 
@@ -376,7 +401,21 @@ def setup_logging(
 
             if azure_handler is not None:
                 azure_handler.addFilter(SkipTaskLogsFilter())
-                azure_handler.addFilter(_custom_dimensions_filter)
+                # AppInsights-bound records get a *handler-scoped*
+                # exception-stripping filter: it shares the dimensions
+                # dict with the logger-level filter (so
+                # ``set_custom_dimensions`` updates both transparently)
+                # but ``filter_exceptions=True`` only applies to the
+                # record on its way to the Azure handler, which is
+                # appended last to ``root.handlers`` and therefore runs
+                # after the rich/plain handler has already emitted the
+                # full traceback.
+                azure_handler.addFilter(
+                    CustomDimensionsFilter(
+                        _custom_dimensions_filter.custom_dimensions,
+                        filter_exceptions=True,
+                    )
+                )
             else:
                 LOG.warning("Azure Monitor handler not found, custom filters not applied")
 

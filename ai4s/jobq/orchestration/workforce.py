@@ -1122,7 +1122,10 @@ class Workforce:
             f"experiments/{self._experiment_name}/runId/{worker.name}/resume"
         )
         token = self._credential.get_token("https://ml.azure.com/.default").token
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        headers: dict[str, str | bytes] = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
         for attempt in range(self._RESUME_MAX_RETRIES + 1):
             response = self.session.post(url, headers=headers, timeout=60)
             if response.status_code < 500 or attempt == self._RESUME_MAX_RETRIES:

@@ -52,6 +52,7 @@ dev = [
     "sphinx-prompt",
     "sphinx-copybutton",
     "sphinx_markdown_builder",
+    "azure-data-tables",
 ]
 workforce = [
     "azure-ai-ml", "pydantic", "azure-containerregistry",
@@ -59,10 +60,14 @@ workforce = [
 track = [
   "dash_bootstrap_components",
   "dash",
+  "dash-cytoscape[extra]",
   "pandas",
   "azure-monitor-query",
   "azure-mgmt-resourcegraph",
   "azure-mgmt-loganalytics",
+]
+workflow = [
+  "azure-data-tables",
 ]
 
 [tool.setuptools.packages.find]
@@ -91,6 +96,7 @@ module = [
   "opencensus.*",
   "ai4s.jobq.ext.amlt_utils",
   "azure.servicebus.*",
+  "azure.containerregistry.*",
   "azure.data.tables.*",
   "azure.monitor.query.*",
   "azure.mgmt.loganalytics.*",
@@ -142,6 +148,7 @@ line-length = 100
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["dist-doc"]
 
 [tool.ruff.lint]
 select = [
@@ -155,6 +162,7 @@ select = [
   "SIM",    # flake8-simplify
   "RUF",    # Ruff-specific rules
   "C4",     # flake8-comprehensions
+  "C90",    # mccabe (cyclomatic complexity)
   "T20",    # flake8-print (no stray prints)
   "PT",     # flake8-pytest-style
   "PLC",    # Pylint convention
@@ -209,6 +217,7 @@ ignore = [
   "S603", "S602", "S607",  # subprocess — orchestration runs commands
   "S311",                  # pseudo-random for jitter — not cryptographic
   "ASYNC220",              # subprocess in async — by design
+  "C901",                  # launch_workers (CC 52) — pre-existing; refactor separately
 ]
 "ai4s/jobq/blob.py" = [
   "S324",    # md5 for content hashing, not security
@@ -222,6 +231,7 @@ ignore = [
   "S301",    # pickle — intentional for serialization
 ]
 "ai4s/jobq/entities.py" = ["S324"]  # md5 for deterministic IDs, not security
+"examples/**/*.py" = ["T201", "S108", "S311", "S603", "S607"]  # print, /tmp, non-crypto random, and subprocess OK in scripts
 "ai4s/jobq/ext/**/*.py" = ["S602", "S603", "S607", "ASYNC230"]  # extensions run subprocesses
 "ai4s/jobq/la_workspace.py" = ["S603", "S607"]  # subprocess calls for CLI tools
 "ai4s/jobq/logging_utils.py" = ["PLW0603", "T201"]  # global for filter management; print for raw task output
@@ -230,6 +240,9 @@ ignore = [
 "scripts/**/*.py" = ["T201", "S603", "S602", "S607"]  # scripts use print and subprocess
 "bench.py" = ["T201", "S603"]  # benchmark script
 "diamond_*.py" = ["T201", "S110", "S603"]  # example scripts
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
 
 [tool.ruff.lint.isort]
 known-third-party = ["amlt", "wandb"]
@@ -240,3 +253,4 @@ fixture-parentheses = false
 [tool.doc8]
 max-line-length = 100
 paths = ["docs"]
+ignore-path = ["docs/_build"]

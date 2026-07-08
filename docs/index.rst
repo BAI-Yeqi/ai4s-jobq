@@ -69,6 +69,19 @@ Key Features
   pre-emptible compute.
 - **Observability**: Workers can transmit telemetry which powers a
   Grafana/local dashboard to monitor queue progress.
+- **Workflows (DAGs)**: Define multi-step pipelines with task
+  dependencies, fan-out/fan-in, conditional branches, retries, and
+  per-task queue routing (for example, CPU prep → GPU train → CPU
+  evaluation). Outputs flow between tasks via small inline values or
+  transparent blob stash for large payloads. See
+  :doc:`workflows` and the :doc:`workflow-tutorial`.
+
+  .. prompt:: bash $ auto
+
+     $ ai4s-jobq workflow validate pipeline.yaml
+     $ ai4s-jobq workflow submit   pipeline.yaml
+     $ ai4s-jobq workflow coordinator   # in another terminal
+     $ ai4s-jobq $QUEUE worker --idle-timeout 5m
 
 
 AI for Science: Powering Large-Scale Research
@@ -114,12 +127,20 @@ It is therefore *crucial* that you only use queues in storage accounts with tigh
 
 
 .. toctree::
+   :caption: Getting Started
    :maxdepth: 2
    :hidden:
 
    basics.md
-   api.md
+
+.. toctree::
+   :caption: Advanced Topics
+   :maxdepth: 2
+   :hidden:
+
+   workflow.md
    monitoring.md
+   api.md
    misc
 
 .. toctree::

@@ -200,6 +200,7 @@ azure-core==1.41.0 \
     --hash=sha256:f46ff5dfcd230f25cf1c19e8a34b8dc08a337b2503e268bb600a16c00db8ad5a
     # via
     #   azure-core-tracing-opentelemetry
+    #   azure-data-tables
     #   azure-identity
     #   azure-monitor-opentelemetry
     #   azure-monitor-opentelemetry-exporter
@@ -211,6 +212,10 @@ azure-core-tracing-opentelemetry==1.0.0b13 \
     --hash=sha256:4dacd3a9f117f11f98e89305e161c951b8df85b984f3b56130614de9cd9887f9 \
     --hash=sha256:6cb2f8dfd5dee6c11843db0205fc92e2434e1a272c169c953afe92483aafc7eb
     # via azure-monitor-opentelemetry
+azure-data-tables==12.7.0 \
+    --hash=sha256:24ed9b5690aa46c213182e32bb1b39a68dd9f526d84f447c287e3a401b437c10 \
+    --hash=sha256:b14fc94a3223a2835ff5688e17d8e107b27c7cd7c4114138f2ac81373723705d
+    # via ai4s-jobq (pyproject.toml)
 azure-identity==1.25.3 \
     --hash=sha256:ab23c0d63015f50b630ef6c6cf395e7262f439ce06e5d07a64e874c724f8d9e6 \
     --hash=sha256:f4d0b956a8146f30333e071374171f3cfa7bdb8073adb8c3814b65567aa7447c
@@ -711,6 +716,7 @@ isodate==0.7.2 \
     --hash=sha256:28009937d8031054830160fce6d409ed342816b543597cece116d966c6d99e15 \
     --hash=sha256:4cd1aa0f43ca76f4a6c6c0292a85f40b35ec2e43e315b59f06e6d32171a953e6
     # via
+    #   azure-data-tables
     #   azure-servicebus
     #   azure-storage-blob
     #   azure-storage-queue
@@ -1872,6 +1878,7 @@ typing-extensions==4.15.0 \
     #   aiosignal
     #   anyio
     #   azure-core
+    #   azure-data-tables
     #   azure-identity
     #   azure-servicebus
     #   azure-storage-blob
@@ -2086,7 +2093,9 @@ yarl==1.24.2 \
     --hash=sha256:f9312b3c02d9b3d23840f67952913c9c8721d7f1b7db305289faefa878f364c2 \
     --hash=sha256:f9a1e9b622ca284143aab5d885848686dcd85453bb1ca9abcdb7503e64dc0056 \
     --hash=sha256:fecd17873a096036c1c87ab3486f1aef7f269ada7f23f7f856f93b1cc7744f14
-    # via aiohttp
+    # via
+    #   aiohttp
+    #   azure-data-tables
 zipp==4.1.0 \
     --hash=sha256:25ad4e16390cd314347dd8f1de67a2ac538ae658ed4ab9db16029c07c188e97f \
     --hash=sha256:4cb57381f544315db7688e976e922a2b18cdb513d21cc194eb42232ba2a3e602

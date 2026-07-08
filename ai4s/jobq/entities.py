@@ -42,6 +42,29 @@ class LockLostError(Exception):
     """
 
 
+class RetryableTaskFailure(Exception):  # noqa: N818 — public API name
+    """Raised by a processor to request redelivery without consuming the
+    jobq retry budget.
+
+    Used by workflow processors that maintain their own retry counter in
+    persistent storage. The jobq receive loop responds by calling
+    ``envelope.replace()`` so the broker redelivers the message to any
+    worker, without decrementing ``task.num_retries``. Callers that want
+    standard jobq-counted retry semantics should raise a plain
+    ``Exception`` instead.
+    """
+
+
+class WorkflowTaskGivenUp(Exception):  # noqa: N818 — public API name
+    """Raised by a processor when its persistent retry budget is exhausted.
+
+    Signals to the jobq receive loop that the message should be deleted
+    (``envelope.delete(success=False)``) regardless of ``task.num_retries`` —
+    the processor has already written the terminal failure to its own
+    persistent store and published any completion notifications.
+    """
+
+
 @dataclass
 class Response:
     is_success: bool

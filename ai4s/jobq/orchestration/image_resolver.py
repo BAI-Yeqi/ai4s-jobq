@@ -138,7 +138,7 @@ class ImageDigestResolver:
             return _format_digest_uri(image_uri, digest)
 
     def _fetch_digest(self, registry: str, repo: str, tag: str) -> str:
-        from azure.containerregistry import ContainerRegistryClient  # type: ignore[import-untyped]
+        from azure.containerregistry import ContainerRegistryClient
 
         endpoint = f"https://{registry}"
         with ContainerRegistryClient(endpoint, self._credential) as client:

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/microsoft/ai4s-jobq/workflow-definition.schema.json",
+  "title": "Workflow Definition",
+  "description": "DAG-based workflow definition for ai4s-jobq.",
+  "type": "object",
+  "required": ["name", "tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Human-readable workflow name.",
+      "minLength": 1
+    },
+    "default_queue": {
+      "type": "string",
+      "description": "Service Bus queue for tasks without an explicit queue.",
+      "default": "default"
+    },
+    "default_task_timeout_s": {
+      "type": ["integer", "null"],
+      "description": "Default timeout in seconds for tasks without an explicit timeout. Null (the default) disables stuck-task detection unless an explicit per-task timeout_s is set.",
+      "default": null,
+      "minimum": 1
+    },
+    "tasks": {
+      "type": "array",
+      "description": "List of tasks forming the DAG.",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/task"
+      }
+    }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique task name within the workflow.",
+          "minLength": 1
+        },
+        "kwargs": {
+          "type": "object",
+          "description": "Keyword arguments passed to the task processor.",
+          "default": {}
+        },
+        "depends_on": {
+          "type": "array",
+          "description": "Names of tasks that must complete before this task runs.",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "queue": {
+          "type": ["string", "null"],
+          "description": "Service Bus queue to route this task to (overrides default_queue).",
+          "default": null
+        },
+        "dep_policy": {
+          "description": "When to run: 'all' (all deps succeed), 'any' (at least one), 'all_settled' (wait for all to finish, then run iff at least one succeeded), or N (at least N succeed).",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["all", "any", "all_settled"]
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ],
+          "default": "all"
+        },
+        "timeout_s": {
+          "type": ["integer", "null"],
+          "description": "Task timeout in seconds (overrides default_task_timeout_s).",
+          "minimum": 1,
+          "default": null
+        },
+        "num_retries": {
+          "type": "integer",
+          "description": "Number of retry attempts on failure.",
+          "minimum": 0,
+          "default": 1
+        },
+        "condition": {
+          "type": ["string", "null"],
+          "description": "Expression evaluated against upstream outputs to decide whether to run or skip this task. Example: inputs[\"train\"].loss < 0.01",
+          "default": null
+        }
+      }
+    }
+  }
+}

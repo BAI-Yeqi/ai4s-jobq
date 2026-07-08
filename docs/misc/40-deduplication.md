@@ -60,8 +60,13 @@ fails and would normally be "replaced" with a decremented retry counter
 **does nothing**—the message is re-delivered with its original content
 after the lock expires.
 
-This means `num_retries` is **not decremented** on Service Bus. If you
-need retry budgets, track attempts in your own application code or rely
-on the Service Bus `MaxDeliveryCount` setting (queues created by
-`ai4s-jobq` use a high delivery count of 1000 to avoid interfering with
-application-level retry logic).
+This means `num_retries` on the jobq `Task` is **not decremented** on
+Service Bus. If you need retry budgets at the jobq layer, track
+attempts in your own application code or rely on the Service Bus
+`MaxDeliveryCount` setting (queues created by `ai4s-jobq` use a high
+delivery count of 1000 to avoid interfering with application-level
+retry logic).
+
+The workflow engine has its own retry budget that does not depend on
+either of these mechanisms—see [Retries](../workflows.md#retries)
+on the workflows page.

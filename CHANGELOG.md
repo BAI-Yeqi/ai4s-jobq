@@ -1,6 +1,56 @@
 CHANGELOG
 =========
 
+3.14.0 (2026-07-07)
+-------------------
+
+Features:
+
+* **New DAG-based workflow orchestration module.** JobQ now ships
+  ``ai4s.jobq.workflow`` for dependency-aware task execution on top of
+  the existing queue backends. Define a DAG of tasks with
+  ``depends_on`` edges, submit it, and let a coordinator dispatch each
+  task once its upstream tasks complete. Highlights:
+
+  * **CLI.** New ``ai4s-jobq workflow`` subcommands: ``submit``,
+    ``validate``, ``status``, ``watch``, ``logs``, ``list``,
+    ``tasks``, ``cancel``, ``retry``, ``coordinator``, ``summary``,
+    ``purge``, ``doctor``, ``explain``, and ``track``.
+  * **Python API.** ``WorkflowClient`` (async context manager) with
+    ``submit``, ``submit_batch``, ``status``, ``watch``, ``cancel``,
+    ``retry``, ``list_workflows``, ``list_tasks``, ``summary``, and
+    ``purge``.
+  * **User-script context.** ``set_output``, ``get_upstream_output``,
+    ``get_upstream_outputs``, ``is_cancelled``, and
+    ``get_real_upstream_tasks`` for tasks to publish results and read
+    upstream outputs. Large outputs are transparently stashed in blob
+    storage.
+  * **Conditional execution.** Tasks can declare a ``condition``
+    expression (for example ``all(upstream_succeeded)``,
+    ``almost_all(0.9)``, ``count(succeeded) >= 3``); tasks whose
+    condition is false are skipped and propagate ``UPSTREAM_FAILED`` to
+    their children.
+  * **Large fan-in support.** ``workflow submit --max-fan-in`` and the
+    ``sequentialize_fan_in()`` helper restructure high-fan-in subgraphs
+    into bounded sequential batches so workflows with thousands of
+    roots stay within Azure Storage message limits.
+  * **Mixed and fully qualified queues.** Workflow queues accept
+    fully qualified names, and a single workflow can mix Azure Storage
+    Queue and Service Bus backends.
+  * **Live monitoring.** ``workflow watch`` renders colour-coded
+    per-layer progress bars with completion-rate and ETA, and the
+    optional ``track`` dashboard gains workflow graph, health, and
+    task-explorer views.
+  * **Coordinator resilience.** A single coordinator per prefix drives
+    retries (via ``attempt_no`` vs ``num_retries``), flushes runtime
+    state to an ETag-guarded blob, and runs a periodic ready-repair
+    sweep to recover tasks whose queue message was lost. ``workflow
+    doctor`` reports stuck workflows.
+
+  Configured via ``JOBQ_WORKFLOW_PREFIX`` (and related
+  ``JOBQ_WORKFLOW_*`` / ``JOBQ_COORDINATOR_*`` env vars). Install the
+  optional dashboard with ``pip install ai4s-jobq[track]``.
+
 3.13.1 (2026-06-10)
 -------------------
 

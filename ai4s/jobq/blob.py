@@ -9,10 +9,10 @@ import pickle
 import typing as ty
 import uuid
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import cached_property
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import aiohttp
@@ -30,8 +30,145 @@ T = ty.TypeVar("T")
 
 @dataclass(frozen=True)
 class BlobStash:
-    filename: str
-    md5sum: str | None = None
+    """Lazy reference to a file already uploaded to Blob Storage.
+
+    Returned both by :class:`BlobContainer` stash helpers
+    (:meth:`BlobContainer.stash_as_pickle`, :meth:`BlobContainer.stash_as_json`)
+    and by the workflow :func:`ai4s.jobq.workflow.context.get_upstream_output`
+    machinery. The legacy attribute names ``filename`` and ``md5sum`` are
+    preserved as read-only aliases so callers of the old two-field
+    dataclass keep working.
+
+    Attributes:
+        blob_name: Path of the blob within the container, e.g.
+            ``"workflow-files/wf123/featurize/foo.pt"`` or
+            ``"abc123.pck"``.
+        md5: Hex-encoded MD5 of the uploaded file. Verified on download
+            for the workflow materialisation API.
+        size: Size of the uploaded file in bytes. ``0`` when unknown.
+
+    For the workflow flow, ``_account``/``_container`` may be set so
+    that :meth:`download_to`, :meth:`read_bytes`, and :meth:`open` can
+    materialise the blob without an explicit client.
+    """
+
+    blob_name: str
+    md5: str = ""
+    size: int = 0
+
+    # Internal: populated lazily by the workflow JSON sentinel hook
+    # (``ai4s.jobq.workflow.stash.stash_object_hook``) so downstream
+    # tasks can call ``download_to`` without configuring a client.
+    # Not part of the wire format.
+    _account: str | None = field(default=None, repr=False, compare=False)
+    _container: str | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def filename(self) -> str:
+        """Trailing path component of :attr:`blob_name`.
+
+        Backward-compatible attribute that the old two-field
+        ``BlobStash`` returned by :class:`BlobContainer` exposed.
+        """
+        return self.blob_name.rsplit("/", 1)[-1]
+
+    @property
+    def md5sum(self) -> str:
+        """Alias for :attr:`md5` kept for backwards compatibility."""
+        return self.md5
+
+    @property
+    def url(self) -> str | None:
+        """Absolute https URL of the blob, if the account is known.
+
+        Returns ``None`` when called outside a workflow worker context
+        (i.e. when ``JOBQ_WORKFLOW_BLOBS``/``JOBQ_WORKFLOW_PREFIX`` cannot be
+        resolved and no account/container was attached at construction).
+        """
+        account, container = self._resolve_account_container()
+        if not account or not container:
+            return None
+        if account == "devstoreaccount1":
+            # Azurite default endpoint
+            return f"http://127.0.0.1:10000/devstoreaccount1/{container}/{self.blob_name}"
+        return f"https://{account}.blob.core.windows.net/{container}/{self.blob_name}"
+
+    def to_marker(self) -> dict[str, ty.Any]:
+        """Render this stash as the workflow JSON sentinel marker."""
+        # Imported lazily to avoid a top-level dependency on workflow code.
+        from ai4s.jobq.workflow.stash import STASH_MARKER, STASH_VERSION
+
+        return {
+            STASH_MARKER: {
+                "v": STASH_VERSION,
+                "state": "ready",
+                "blob_name": self.blob_name,
+                "md5": self.md5,
+                "size": self.size,
+            }
+        }
+
+    # ----- materialisation API (sync; downstream user-script friendly) -----
+
+    def download_to(self, local_path: str | os.PathLike[str]) -> Path:
+        """Download the blob to *local_path* and return it as a :class:`Path`.
+
+        Verifies the MD5 checksum after download. Parent directories are
+        created if missing. Existing files at *local_path* are
+        overwritten.
+        """
+        from ai4s.jobq.workflow._stash_io import download_blob_to_path
+
+        return download_blob_to_path(self, Path(os.fspath(local_path)))
+
+    def read_bytes(self) -> bytes:
+        """Download the blob and return its full contents in memory."""
+        from ai4s.jobq.workflow._stash_io import read_blob_bytes
+
+        return read_blob_bytes(self)
+
+    def open(self, mode: str = "rb") -> ty.IO[ty.Any]:
+        """Download the blob to a temp file and return an open file object.
+
+        Caller is responsible for closing the file. The temp file is
+        deleted automatically when the file object is closed (best
+        effort).
+        """
+        if "w" in mode or "a" in mode or "+" in mode:
+            raise ValueError(
+                f"BlobStash.open does not support write mode {mode!r}; blob is read-only"
+            )
+        import contextlib
+        import tempfile
+
+        suffix = "_" + self.filename if self.filename else ""
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        try:
+            self.download_to(tmp.name)
+            tmp.close()
+            return open(tmp.name, mode)
+        except BaseException:
+            tmp.close()
+            with contextlib.suppress(OSError):
+                os.unlink(tmp.name)
+            raise
+
+    def _resolve_account_container(self) -> tuple[str | None, str | None]:
+        """Best-effort lookup of the blob account/container for this stash.
+
+        Uses values cached on the instance (set by the workflow JSON
+        sentinel hook or by ``BlobContainer`` stash helpers) if present;
+        otherwise falls back to the workflow environment.
+        """
+        if self._account and self._container:
+            return self._account, self._container
+        try:
+            from ai4s.jobq.workflow.env import WorkflowEnv
+
+            env = WorkflowEnv.from_environ()
+        except Exception:
+            return None, None
+        return env.blob_account, env.blob_container
 
 
 class BlobStats(TextColumn):
@@ -232,8 +369,11 @@ class BlobContainer(_AbstractAsyncContextManager["BlobContainer"]):
         data.seek(0)
         await self.client.upload_blob(filename, data, overwrite=True)
         return BlobStash(
-            filename=filename,
-            md5sum=md5sum,
+            blob_name=filename,
+            md5=md5sum,
+            size=len(content),
+            _account=self._storage_account,
+            _container=self._container,
         )
 
     async def unstash_from_pickle(self, filename, md5sum) -> ty.Any:
@@ -247,6 +387,47 @@ class BlobContainer(_AbstractAsyncContextManager["BlobContainer"]):
                 f"The md5 hash ({md5sum}) of {filename} does not match the expected md5 hash ({expected_md5sum})!"
             )
         return pickle.loads(content)
+
+    async def stash_as_json(self, data: ty.Any, filename: str | None = None) -> "BlobStash":
+        """Store JSON-serializable data in blob storage.
+
+        Unlike :meth:`stash_as_pickle`, this uses JSON encoding which is
+        safer for cross-process data exchange (no arbitrary code execution
+        on deserialization).
+
+        Args:
+            data: any JSON-serializable object.
+            filename: blob name (default: random UUID with ``.json`` suffix).
+        """
+        import json
+
+        if filename is None:
+            filename = f"{uuid.uuid4()}.json"
+        content = json.dumps(data).encode()
+        md5sum = hashlib.md5(content).hexdigest()
+        await self.client.upload_blob(filename, io.BytesIO(content), overwrite=True)
+        return BlobStash(
+            blob_name=filename,
+            md5=md5sum,
+            size=len(content),
+            _account=self._storage_account,
+            _container=self._container,
+        )
+
+    async def unstash_from_json(self, filename: str, md5sum: str | None = None) -> ty.Any:
+        """Retrieve JSON data previously stored with :meth:`stash_as_json`."""
+        import json
+
+        stream = await self.client.download_blob(filename)
+        content = await stream.readall()
+        if md5sum:
+            actual = hashlib.md5(content).hexdigest()
+            if actual != md5sum:
+                raise RuntimeError(
+                    f"The md5 hash ({actual}) of {filename} does not match "
+                    f"the expected md5 hash ({md5sum})!"
+                )
+        return json.loads(content)
 
     async def upload_from_folder(
         self,

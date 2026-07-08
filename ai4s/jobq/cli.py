@@ -7,14 +7,13 @@ import math
 import os
 import subprocess
 import sys
+from collections.abc import AsyncGenerator, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from tempfile import NamedTemporaryFile
 from typing import (
     Any,
-    AsyncGenerator,
-    Iterable,
     TypeVar,
 )
 
@@ -60,7 +59,7 @@ class StorageQueueSpec(BackendSpec):
 
 
 # Commands that don't require a BACKEND_SPEC argument
-_NO_BACKEND_COMMANDS = {"copilot-skill"}
+_NO_BACKEND_COMMANDS = {"copilot-skill", "workflow", "track"}
 
 
 class JobQGroup(click.Group):
@@ -178,6 +177,10 @@ class ProcessorParam(click.ParamType):
         if value is None:
             return None
         if value == "shell":
+            if os.environ.get("JOBQ_WORKFLOW_PREFIX"):
+                from ai4s.jobq.workflow.worker import WorkflowShellCommandProcessor
+
+                return WorkflowShellCommandProcessor
             return ShellCommandProcessor
         if value == "map-in-config":
             from ai4s.jobq.ext.map_in_config import MapInConfigProcessor
@@ -189,7 +192,6 @@ class ProcessorParam(click.ParamType):
 @dataclass
 class QueueConfig:
     backend_spec: BackendSpec | None = None
-    conn_str: str | None = None
     credential: str | AsyncTokenCredential | None = None
     log_handler: JobQRichHandler | None = None
     duplicate_detection_window: timedelta | None = None
@@ -201,11 +203,27 @@ class QueueConfig:
             # this is ensured since they come from a click.argument
             assert self.backend_spec is not None
 
-            if self.conn_str is not None:
+            # Auto-detect connection string from JOBQ_STORAGE.
+            conn_str: str | None = None
+            jobq_storage = os.environ.get("JOBQ_STORAGE", "")
+            if "AccountKey=" in jobq_storage or "SharedAccessSignature=" in jobq_storage:
+                conn_str = jobq_storage
+
+            # Azurite uses a well-known account name; AAD doesn't work.
+            if (
+                conn_str is None
+                and isinstance(self.backend_spec, StorageQueueSpec)
+                and self.backend_spec.storage_account == "devstoreaccount1"
+            ):
+                from ai4s.jobq.backend.storage_queue import azurite_conn_str
+
+                conn_str = azurite_conn_str()
+
+            if conn_str is not None:
                 queue = await stack.enter_async_context(
                     JobQ.from_connection_string(
                         self.backend_spec.name,
-                        connection_string=self.conn_str,
+                        connection_string=conn_str,
                         exist_ok=exist_ok,
                         credential=self.credential,
                     )
@@ -258,12 +276,6 @@ class QueueConfig:
     required=False,
     default=None,
 )
-@click.option(
-    "--conn-str",
-    envvar="JOBQ_CONNECTION_STRING",
-    hidden=True,
-    help="Connection string for the queue",
-)
 @click.option("--verbose", "-v", count=True, help="Enable verbose logging.")
 @click.option("--quiet", "-q", count=True, help="Enable verbose logging.")
 @click.pass_context
@@ -272,7 +284,6 @@ async def main(
     backend_spec: BackendSpec | None,
     verbose: int,
     quiet: int,
-    conn_str: str,
 ) -> None:
     """
     Interact with the job queue, assuming commands are shell commands.
@@ -302,7 +313,21 @@ async def main(
         )
 
         ctx.obj.backend_spec = backend_spec
-        ctx.obj.conn_str = conn_str
+        ctx.obj.log_handler = log_handler
+    elif verbose or quiet:
+        # No backend_spec (e.g. workflow subcommands) but user
+        # requested verbose/quiet — still set up logging.
+        internal_log_level = max(logging.DEBUG, logging.INFO - 10 * (verbose - quiet))
+        base_log_level = logging.WARNING
+        if abs(verbose - quiet) >= 2:
+            diff = int(math.copysign(abs(verbose - quiet) - 2, verbose - quiet))
+            base_log_level = max(logging.DEBUG, base_log_level - 10 * diff)
+
+        log_handler = setup_logging(
+            "workflow",
+            internal_log_level=internal_log_level,
+            base_log_level=base_log_level,
+        )
         ctx.obj.log_handler = log_handler
 
 
@@ -335,6 +360,13 @@ async def main(
     default=None,
     help="Duplicate detection window, e.g. 7d, 12h (Service Bus only, default: 7d).",
 )
+@click.option(
+    "--workflow",
+    is_flag=True,
+    help="Submit as a tracked workflow (requires JOBQ_WORKFLOW_PREFIX). "
+    "Each command becomes a single-task workflow visible via "
+    "'ai4s-jobq workflow status'.",
+)
 @click.pass_context
 async def push(
     ctx: click.Context,
@@ -345,6 +377,7 @@ async def push(
     wait: bool,
     num_enqueue_workers: int,
     dedup_window: timedelta | None,
+    workflow: bool,
 ) -> None:
     """
     Enqueue a new job to the job queue.
@@ -359,6 +392,44 @@ async def push(
 
     if dedup_window is not None:
         ctx.obj.duplicate_detection_window = dedup_window
+
+    # --workflow: submit each command as a single-task workflow
+    if workflow:
+        try:
+            from ai4s.jobq.workflow.client import WorkflowClient
+            from ai4s.jobq.workflow.entities import WorkflowDefinition, WorkflowTask
+            from ai4s.jobq.workflow.env import WorkflowEnv, WorkflowEnvError
+        except ImportError:
+            raise click.UsageError(
+                "--workflow requires the [workflow] extra. "
+                "Install with: pip install ai4s-jobq[workflow]"
+            ) from None
+
+        try:
+            WorkflowEnv.from_environ()
+        except WorkflowEnvError as exc:
+            raise click.UsageError(f"--workflow: {exc}") from exc
+
+        async with await WorkflowClient.from_environment() as client:
+            for raw_cmd in command:
+                line = raw_cmd.strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    job_spec = json.loads(line)
+                    job_spec.setdefault("env", {}).update(env)
+                    job_spec.setdefault("bg_dirsync_to", bg_dirsync_to)
+                    kwargs = job_spec
+                else:
+                    kwargs = {"cmd": line, "bg_dirsync_to": bg_dirsync_to, "env": env}
+
+                definition = WorkflowDefinition(
+                    name=kwargs.get("cmd", line)[:80],
+                    tasks=[WorkflowTask(name="main", kwargs=kwargs, num_retries=num_retries)],
+                )
+                wf_id = await client.submit(definition)
+                click.echo(wf_id)
+        return
 
     class IteratorWorkSpec(WorkSpecification[dict[str, Any], DefaultSeed]):
         async def list_tasks(
@@ -581,6 +652,30 @@ async def pull(
     is_flag=True,
     help="Emulate a TTY for the worker, forces line buffering (useful if logs get lost when preempted).",
 )
+@click.option(
+    "--idle-timeout",
+    type=DurationParam(),
+    envvar="JOBQ_IDLE_TIMEOUT",
+    default=None,
+    help=(
+        "Keep the worker alive when the queue is empty, retrying with "
+        "exponential backoff. Exits after this duration with no new tasks. "
+        "Useful for workflow DAGs where tasks arrive in waves."
+    ),
+)
+@click.option(
+    "--max-idle-backoff",
+    type=DurationParam(),
+    envvar="JOBQ_MAX_IDLE_BACKOFF",
+    default=None,
+    help=(
+        "Upper bound on the empty-queue exponential backoff (defaults to "
+        "30 s). Workflow workers feeding off a coordinator that trickles "
+        "tasks one at a time should set this much lower (e.g. 2s) so all "
+        "workers don't end up sleeping the full 30s between polls. Only "
+        "meaningful in combination with --idle-timeout."
+    ),
+)
 @click.pass_context
 async def workers(
     ctx: click.Context,
@@ -591,6 +686,8 @@ async def workers(
     heartbeat: bool,
     proc_cls: type[Processor],
     emulate_tty: bool = False,
+    idle_timeout: timedelta | None = None,
+    max_idle_backoff: timedelta | None = None,
 ) -> None:
     """Like pull, but start multiple async workers."""
 
@@ -606,6 +703,11 @@ async def workers(
         time_limit,
         os.getpid(),
     )
+
+    # Propagate the worker's backend spec as JOBQ_STORAGE so subprocesses
+    # using ``JobQ.from_environment`` can reach the same queue.
+    if not os.environ.get("JOBQ_STORAGE") and cfg.backend_spec is not None:
+        os.environ["JOBQ_STORAGE"] = str(cfg.backend_spec)
 
     async with AsyncExitStack() as stack:
         queue = await stack.enter_async_context(ctx.obj.get(exist_ok=True))
@@ -626,6 +728,8 @@ async def workers(
                 with_heartbeat=heartbeat,
                 show_progress=sys.stdin.isatty(),  # Only in interactive sessions.
                 environment_name=os.environ.get("JOBQ_ENVIRONMENT_NAME", ""),
+                idle_timeout=idle_timeout,
+                max_idle_backoff=max_idle_backoff,
             )
 
 
@@ -649,16 +753,18 @@ class LAWorkspaceId(click.ParamType):
     name = "LogAnalytics-Workspace"
 
     def convert(self, value, param, ctx):
-        try:
-            import ai4s.jobq.la_workspace as la_tools
-        except ImportError:
-            _missing_track_deps()
-
         if value is None:
             if value := os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING"):
                 LOG.info("Using APPLICATIONINSIGHTS_CONNECTION_STRING from environment.")
             elif value := os.environ.get("APPLICATIONINSIGHTS_INSTRUMENTATIONKEY"):
                 LOG.info("Using APPLICATIONINSIGHTS_INSTRUMENTATIONKEY from environment.")
+            else:
+                return None
+
+        try:
+            import ai4s.jobq.la_workspace as la_tools
+        except ImportError:
+            _missing_track_deps()
 
         if value.startswith("/subscriptions/"):
             return la_tools.workspace_id_from_workspace_resource_id(value)
@@ -698,7 +804,7 @@ def _set_subscription_id(
     type=LAWorkspaceId(),
     metavar="LOG_ANALYTICS_WORKSPACE",
     envvar="JOBQ_LA_WORKSPACE",
-    required=True,
+    required=False,
 )
 @click.option("port", "-p", default=8050, type=int, help="Port to run the dashboard on.")
 @click.option(
@@ -709,35 +815,80 @@ def _set_subscription_id(
     envvar="JOBQ_AZURE_SUBSCRIPTION_ID",
     callback=_set_subscription_id,
 )
+@click.option(
+    "--workflow",
+    metavar="ACCOUNT/PREFIX",
+    envvar="JOBQ_WORKFLOW_PREFIX",
+    default=None,
+    help="Enable the Workflow Dashboard tab.  Pass ACCOUNT/PREFIX or set JOBQ_WORKFLOW_PREFIX.",
+)
+@click.option(
+    "--workflow-file",
+    type=click.Path(exists=True, dir_okay=False),
+    envvar="JOBQ_WORKFLOW_FILE",
+    default=None,
+    help="Visualize a local workflow JSON/YAML file without submitting it.",
+)
 @click.option("--debug", is_flag=True, help="Enable debug logging.")
 @click.pass_context
-async def track(ctx: click.Context, log_analytics_workspace, debug, port) -> None:
+async def track(
+    ctx: click.Context,
+    log_analytics_workspace,
+    debug,
+    port,
+    workflow,
+    workflow_file,
+) -> None:
     """
     Track the queue size and print it every 10 seconds.
 
     You can set JOBQ_LA_WORKSPACE_ID to the workspace ID of your Azure Log Analytics workspace.
+
+    Pass --workflow ACCOUNT/PREFIX (or set JOBQ_WORKFLOW_PREFIX) to also show
+    the Workflow Dashboard tab with live Table Storage queries.
     """
 
-    workspace_id = log_analytics_workspace
+    if not (log_analytics_workspace or workflow or workflow_file):
+        raise click.UsageError(
+            "Specify at least one data source: LOG_ANALYTICS_WORKSPACE, "
+            "--workflow ACCOUNT/PREFIX, or --workflow-file PATH."
+        )
 
-    if not _jobq_track_requirements_are_available():
+    if not _jobq_track_requirements_are_available(
+        require_log_analytics=bool(log_analytics_workspace)
+    ):
         _missing_track_deps()
 
     from ai4s.jobq.track.app import run_with_default_queue
 
     queue = ctx.obj.backend_spec
 
-    os.environ["JOBQ_LA_WORKSPACE_ID"] = workspace_id
+    if log_analytics_workspace:
+        os.environ["JOBQ_LA_WORKSPACE_ID"] = log_analytics_workspace
+    else:
+        os.environ.pop("JOBQ_LA_WORKSPACE_ID", None)
 
-    run_with_default_queue(f"{queue!s}/{queue.name}", debug=debug, port=port)
+    if workflow:
+        os.environ["JOBQ_WORKFLOW_PREFIX"] = workflow
+
+    if workflow_file:
+        os.environ["JOBQ_WORKFLOW_FILE"] = str(workflow_file)
+        if workflow:
+            LOG.warning("Ignoring --workflow because --workflow-file is set.")
+        os.environ.pop("JOBQ_WORKFLOW_PREFIX", None)
+
+    queue_name = f"{queue!s}/{queue.name}" if queue is not None else None
+    run_with_default_queue(queue_name, debug=debug, port=port)
 
 
-def _jobq_track_requirements_are_available() -> bool:
+def _jobq_track_requirements_are_available(*, require_log_analytics: bool) -> bool:
     """Check if the requirements for jobq track are available."""
     try:
-        import azure.monitor.query  # noqa: F401
         import dash  # noqa: F401
         import pandas  # noqa: F401
+
+        if require_log_analytics:
+            import azure.monitor.query  # noqa: F401
 
         return True
     except ImportError:
@@ -786,3 +937,20 @@ def _install_copilot_skill():  # pragma: no cover
 
 
 main.add_command(skill_file_cmd)
+
+try:
+    from ai4s.jobq.workflow.cli import workflow_group
+
+    main.add_command(workflow_group)
+except ImportError:
+    # [workflow] extra not installed — register a stub that prints a
+    # helpful install hint instead of silently hiding the subcommand.
+    import asyncclick as click
+
+    @main.group("workflow")
+    def _workflow_stub() -> None:
+        """Workflow DAG commands (requires ai4s-jobq[workflow])."""
+        raise click.UsageError(
+            "Workflow commands require the [workflow] extra. "
+            "Install with: pip install ai4s-jobq[workflow]"
+        )

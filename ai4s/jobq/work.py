@@ -106,15 +106,26 @@ def _env_wrapper(
 
 
 async def read_stream_and_log(
-    stream: asyncio.StreamReader, log_msg_queue: "queue.Queue", job_id: str, level: int
+    stream: asyncio.StreamReader,
+    log_msg_queue: "queue.Queue",
+    job_id: str,
+    level: int,
+    dimensions: dict[str, str] | None = None,
 ) -> None:
-    """puts all lines from stream into queue, together with the level."""
+    """puts all lines from stream into queue, together with the level.
+
+    *dimensions*, if given, are forwarded as a 4th tuple element so that
+    ``log_from_queue`` can attach them as ``custom_dimensions`` on the
+    emitted log record. This lets callers tag stdout/stderr lines with
+    contextual metadata (e.g. ``workflow_id``, ``task_name``) without
+    needing process-wide state.
+    """
     while True:
         line = await stream.readline()
         if not line:
             # not even '\n'!
             break
-        log_msg_queue.put((level, job_id, line.decode("utf-8").rstrip()))
+        log_msg_queue.put((level, job_id, line.decode("utf-8").rstrip(), dimensions))
 
 
 async def run_cmd_and_log_outputs(
@@ -123,6 +134,7 @@ async def run_cmd_and_log_outputs(
     job_id: str,
     cwd: str | None,
     emulate_tty: bool = False,
+    dimensions: dict[str, str] | None = None,
 ) -> int:
     """
     Runs the command in cmd and puts stdout/stderr into a queue.
@@ -137,7 +149,7 @@ async def run_cmd_and_log_outputs(
         if params:
             msg = msg % params
         try:
-            log_msg_queue.put((level, job_id, msg))
+            log_msg_queue.put((level, job_id, msg, dimensions))
         except Exception:
             print(f"Could not log {level} message: {msg}")  # noqa: T201
 
@@ -244,8 +256,8 @@ async def run_cmd_and_log_outputs(
 
     read_task = asyncio.ensure_future(
         asyncio.gather(
-            read_stream_and_log(stdout, log_msg_queue, job_id, logging.INFO),
-            read_stream_and_log(stderr, log_msg_queue, job_id, logging.WARNING),
+            read_stream_and_log(stdout, log_msg_queue, job_id, logging.INFO, dimensions),
+            read_stream_and_log(stderr, log_msg_queue, job_id, logging.WARNING, dimensions),
             return_exceptions=True,
         )
     )
@@ -623,7 +635,13 @@ class ProcessPool(_AbstractAsyncContextManager["ProcessPool"]):
                         # filters do not get inherited automatically by child loggers
                         for f in LOG.filters:
                             log.addFilter(f)
-                        log.log(item[0], item[2])
+                        # Optional 4th tuple element: per-message custom dimensions
+                        # (used by WorkflowShellCommandProcessor to tag stdout/stderr
+                        # lines with workflow_id/task_name without process-wide state).
+                        extra: dict[str, ty.Any] | None = None
+                        if len(item) > 3 and item[3]:
+                            extra = {"custom_dimensions": item[3]}
+                        log.log(item[0], item[2], extra=extra)
                     except Exception:
                         LOG.exception("Error in logging message queue.")
                         continue
@@ -704,6 +722,7 @@ class ShellCommandProcessor(Processor):
         job_id: str,
         cwd: str | None,
         emulate_tty: bool = False,
+        log_dimensions: dict[str, str] | None = None,
     ) -> int:
         """
         It's not strictly necessary to run this in asyncio, since we're
@@ -711,7 +730,9 @@ class ShellCommandProcessor(Processor):
         both stdout and stderr at the same time, and forward their output to
         the main process's logger.
         """
-        return asyncio.run(run_cmd_and_log_outputs(cmd, apqueue, job_id, cwd, emulate_tty))
+        return asyncio.run(
+            run_cmd_and_log_outputs(cmd, apqueue, job_id, cwd, emulate_tty, log_dimensions)
+        )
 
     async def resume(self) -> None:
         LOG.info("Resuming ShellCommandProcessor.")
@@ -727,7 +748,16 @@ class ShellCommandProcessor(Processor):
         bg_dirsync_to: str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        _log_dimensions: dict[str, str] | None = None,
+        **kwargs: ty.Any,
     ) -> int:
+        if "__workflow_id" in kwargs:
+            raise RuntimeError(
+                "This task belongs to a workflow but the worker is not running "
+                "in workflow mode. Set JOBQ_WORKFLOW_PREFIX=<account>/<prefix> before "
+                "launching the worker so that completions are reported back to "
+                "the coordinator."
+            )
         assert self.pool.log_msg_queue is not None, "Log message queue not initialized."
         call = partial(
             self._subprocess_call,
@@ -736,6 +766,7 @@ class ShellCommandProcessor(Processor):
             job_id=_job_id,
             cwd=cwd,
             emulate_tty=self.emulate_tty,
+            log_dimensions=_log_dimensions,
         )
         if env is None:
             env = {}

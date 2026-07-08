@@ -6,3 +6,6 @@ ai4s_jobq.egg-info/
 docs-dist
 ai4s/jobq/data/skill/ai4s-jobq-cli/
 vale-styles/Google/
+docs/workflow-completion-redesign.md
+docs/_build/
+examples/stress_test/logs/

@@ -156,6 +156,42 @@ class TestRESTServiceBusEnvelope:
         env._client.send_message.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_replace_is_noop_for_retry_budget(self):
+        """Pin the documented SB limitation: ``replace`` does NOT decrement num_retries.
+
+        Plain JobQ on Storage Queue uses ``envelope.replace(task)`` to persist a
+        decremented ``num_retries`` so a task that keeps failing eventually gives
+        up. On Service Bus there is no in-place update API and resending the same
+        MessageId is silently de-duped, so ``replace`` is a documented no-op:
+        the message is re-delivered with its original body after the lock expires
+        (see ``servicebus_rest.py::RESTServiceBusEnvelope.replace``).
+
+        Consequence: the *only* retry-budget signal for plain JobQ on Service Bus
+        is the broker's ``DeliveryCount`` against the queue's ``MaxDeliveryCount``
+        (1000). Workflow tasks side-step this entirely by tracking
+        ``retries_remaining`` server-side in Table Storage.
+
+        This test pins that contract so anyone introducing a real ``replace``
+        implementation here also has to update the workflow/JobQ retry plumbing
+        accordingly.
+        """
+        env = self._make_envelope()
+        original_retries = env.task.num_retries
+
+        decremented = Task(kwargs={"cmd": "echo retry"}, num_retries=original_retries + 7)
+        await env.replace(decremented)
+
+        env._client.send_message.assert_not_awaited()
+        env._client.complete_message.assert_not_awaited()
+        env._client.deadletter_message.assert_not_awaited()
+        env._client.unlock_message.assert_not_awaited()
+        assert env.task.num_retries == original_retries, (
+            "replace() must not mutate the envelope's task on Service Bus — "
+            "the broker will re-deliver the original message body unchanged"
+        )
+        assert not env.done, "replace() must not settle the message"
+
+    @pytest.mark.asyncio
     async def test_reply_not_implemented(self):
         env = self._make_envelope()
         with pytest.raises(NotImplementedError):

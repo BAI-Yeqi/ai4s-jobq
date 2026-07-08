@@ -72,13 +72,7 @@ jobs:
     needs: lint
     strategy:
       matrix:
-        include:
-          - python-version: '3.10'
-            toxenv: py310
-          - python-version: '3.11'
-            toxenv: py311
-          - python-version: '3.12'
-            toxenv: py312
+        python-version: ['3.10', '3.11', '3.12']
 
     steps:
     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -92,10 +86,10 @@ jobs:
         ./node_modules/.bin/azurite-blob --skipApiVersionCheck --inMemoryPersistence --blobPort 10000 &
         ./node_modules/.bin/azurite-queue --skipApiVersionCheck --inMemoryPersistence --queuePort 10001 &
         python -m pip install --upgrade pip
-        python -m pip install tox tox-gh-actions
-    - name: Test with tox
+        python -m pip install -e ".[dev,workforce]"
+    - name: Test with pytest
       run: |
-        tox -e ${{ matrix.toxenv }}
+        pytest
 
   docs:
     name: Docs Accessibility
@@ -106,10 +100,15 @@ jobs:
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: '3.12'
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install tox tox-gh-actions
+        python -m pip install -e .[dev]
+        npm install -D pa11y-ci
     - name: Test Docs Accessibility
       run: |
-        tox -e accessibility
+        bash ./scripts/check-docs-accessibility.sh

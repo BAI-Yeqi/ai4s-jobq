@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/ai4s-jobq/main/ai4s/jobq/workflow/data/workflow-definition.schema.json
+name: featurize-and-train
+default_queue: default
+tasks:
+  - name: featurize
+    kwargs:
+      cmd: python featurize.py
+  - name: train
+    kwargs:
+      cmd: python train.py
+    depends_on: [featurize]

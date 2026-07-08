@@ -49,6 +49,11 @@ source_suffix = {
     ".md": "markdown",
 }
 
+# Auto-generate anchors for Markdown headings (h1-h3) so that
+# in-page links like [link](#some-heading) and cross-page links like
+# [link](other.md#some-heading) resolve in MyST.
+myst_heading_anchors = 3
+
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
@@ -59,7 +64,6 @@ html_logo = "_static/logo.png"
 html_css_files = ["custom.css"]
 html_theme_options = {
     "logo_only": True,
-    "display_version": False,
     "navigation_depth": 2,
 }
 

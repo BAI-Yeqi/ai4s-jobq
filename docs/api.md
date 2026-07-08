@@ -9,6 +9,266 @@ shell has too much overhead. Examples are:
 You get the most out of the Python API if you write (...and your performance
 depends on...) `async` code, but it's not strictly necessary.
 
+
+## Workflows
+
+The workflow CLI ([`ai4s-jobq workflow ...`](workflows.md)) is the
+recommended way to submit and operate workflows. Use the Python API
+when you want programmatic submission, custom processors, or when
+integrating workflow tasks into a longer-running Python service. The
+YAML schema, CLI operations, dependency policies, and architecture are
+covered in the [workflow reference](workflows.md).
+
+### Submitting workflows from Python
+
+You can construct workflow definitions directly in Python when a service
+or notebook already owns the pipeline structure:
+
+```python
+from ai4s.jobq.workflow import WorkflowDefinition, WorkflowTask
+
+workflow = WorkflowDefinition(
+    name="featurize-and-train",
+    tasks=[
+        WorkflowTask(
+            name="featurize",
+            kwargs={"input": "abfs://data/raw.parquet", "output": "abfs://data/features.parquet"},
+        ),
+        WorkflowTask(
+            name="train-gnn",
+            kwargs={"model": "schnet", "epochs": 100, "data": "abfs://data/features.parquet"},
+            depends_on=["featurize"],
+            queue="gpu-a100",
+        ),
+        WorkflowTask(
+            name="train-rf",
+            kwargs={"model": "random-forest", "data": "abfs://data/features.parquet"},
+            depends_on=["featurize"],
+            queue="cpu-64core",
+        ),
+        WorkflowTask(
+            name="compare",
+            kwargs={"metric": "mae"},
+            depends_on=["train-gnn", "train-rf"],
+        ),
+    ],
+    default_queue="cpu-general",
+)
+```
+
+Submit and inspect workflows with `WorkflowClient`:
+
+```python
+from ai4s.jobq.workflow import WorkflowClient
+
+async with await WorkflowClient.from_environment() as client:
+    wf_id = await client.submit(workflow)
+
+    status = await client.status(wf_id)
+    for name, task in status.tasks.items():
+        print(f"{name}: {task.status}")
+
+# With a custom table prefix:
+async with await WorkflowClient.from_environment(prefix="MyProject") as client:
+    ...
+```
+
+Task-name prefix filters use the workflow's runtime-state blob and
+are O(num_tasks)—fast for typical workflows (hundreds to low
+thousands of tasks). To inspect a subset of tasks programmatically:
+
+```python
+async with await WorkflowClient.from_environment() as client:
+    train_tasks = await client.list_tasks(
+        wf_id, name_prefix="train-"
+    )
+```
+
+### Producing outputs from Python tasks
+
+Scripts and processors use `set_output()` to return JSON-serializable
+data to downstream workflow tasks. The shell-worker examples in the
+[workflow reference](workflows.md#producing-and-consuming-task-outputs)
+show the CLI-adjacent path; the same helpers are useful from Python code
+that runs inside a workflow task.
+
+```python
+#!/usr/bin/env python3
+"""featurize.py—produces output for downstream tasks."""
+from ai4s.jobq.workflow import set_output
+
+# Do work...
+features_path = "abfs://data/features.parquet"
+stats = {"rows": 1_000_000, "columns": 128}
+
+# Pass results to downstream tasks (JSON-serializable)
+set_output({"path": features_path, "stats": stats})
+```
+
+Downstream tasks can fetch the output of completed dependencies:
+
+```python
+#!/usr/bin/env python3
+"""train.py—consumes upstream output."""
+from ai4s.jobq.workflow.context import get_upstream_output, set_output
+
+# Fetch output from the "featurize" task
+features = get_upstream_output("featurize")
+data_path = features["path"]
+print(f"Training on {data_path} ({features['stats']['rows']} rows)")
+
+# ... train model ...
+
+# Return our own output for downstream tasks
+set_output({"mae": 0.03, "checkpoint": "abfs://models/schnet-v2.pt"})
+```
+
+When a task has `dep_policy="any"` or an integer policy, use
+`get_upstream_outputs()` to discover which dependencies actually
+succeeded:
+
+```python
+from ai4s.jobq.workflow.context import get_upstream_outputs
+
+outputs = get_upstream_outputs()
+# outputs = {"train-rf": {"mae": 0.42}}  (train-gnn may have failed)
+for model_name, result in outputs.items():
+    print(f"{model_name}: MAE={result['mae']}")
+```
+
+Long-running Python tasks can also poll for cancellation:
+
+```python
+from ai4s.jobq.workflow.context import is_cancelled, set_output
+
+for epoch in range(1000):
+    train_one_epoch()
+    if is_cancelled():
+        set_output({"last_epoch": epoch})
+        break
+else:
+    set_output({"mae": 0.03, "checkpoint": "model.pt"})
+```
+
+### File outputs with BlobStasher and BlobStash
+
+Use file outputs when a task produces a real file that downstream tasks
+need to consume, such as a model checkpoint, parquet file, or tarball.
+Keep small metadata in regular JSON output, but wrap large files with
+`BlobStasher.from_file(path)` so the workflow worker uploads the file
+once and downstream tasks can download it lazily.
+
+Producer tasks put a `BlobStasher` marker inside `set_output()`:
+
+```python
+#!/usr/bin/env python3
+from ai4s.jobq.workflow import BlobStasher
+from ai4s.jobq.workflow.context import set_output
+
+# ... train model and write model.pt ...
+
+set_output(
+    {
+        "checkpoint": BlobStasher.from_file("model.pt"),
+        "mae": 0.03,
+    }
+)
+```
+
+No upload happens inside `set_output()`. The worker reads the output
+after the script exits, uploads each marked file, and then records a
+reference for downstream tasks. File outputs require
+`JOBQ_WORKFLOW_BLOBS=<account>/<container>`. If it is not configured,
+using `BlobStasher.from_file(...)` fails the task with a clear error.
+
+Downstream tasks receive a lazy `BlobStash` reference:
+
+```python
+#!/usr/bin/env python3
+from ai4s.jobq.workflow.context import get_upstream_output
+
+train = get_upstream_output("train")
+checkpoint = train["checkpoint"]
+
+checkpoint.download_to("local/model.pt")  # write to a local path
+weights = checkpoint.read_bytes()         # or read all bytes into memory
+
+with checkpoint.open("rb") as f:          # or use a file-like object
+    header = f.read(16)
+```
+
+`BlobStash` also exposes `url`, `blob_name`, `md5`, and `size` for
+logging or validation. Files land in the configured container under
+`workflow-files/{workflow_id}/{task_name}/{filename}`; for example,
+`jobq-workflow-data/workflow-files/wf123/train/model.pt`.
+
+Filenames are preserved. If the same task uploads the same filename
+again, the later upload overwrites the earlier blob. This matches
+workflow retry semantics: retries are at least once, and a successful
+retry can replace the file from an earlier attempt.
+
+Current limitations:
+
+- File outputs support single files only; directory uploads are not yet
+  supported.
+- Purging a workflow does not garbage-collect uploaded file blobs.
+
+### Custom workflow processors
+
+When `JOBQ_WORKFLOW_PREFIX` is set, CLI workers that use `--processor shell`
+automatically upgrade to `WorkflowShellCommandProcessor`. Python services
+can instantiate the processor directly when they launch workers in
+process:
+
+```python
+from ai4s.jobq import JobQ, launch_workers
+from ai4s.jobq.workflow import WorkflowShellCommandProcessor
+
+async with JobQ.from_environment() as jobq:
+    async with WorkflowShellCommandProcessor(
+        num_workers=4,
+        emulate_tty=True,
+        completion_queue="myproject-workflow-completions",
+    ) as processor:
+        await launch_workers(jobq, processor)
+```
+
+If you write a Python `Processor` class directly instead of shell
+commands, use `WorkflowContext.from_kwargs()`:
+
+```python
+from ai4s.jobq.work import Processor
+from ai4s.jobq.workflow.context import WorkflowContext
+from ai4s.jobq.workflow.entities import WorkflowCompletion, serialize_output
+
+
+class TrainProcessor(Processor):
+    async def __call__(self, **kwargs):
+        wf_id = kwargs.pop("__workflow_id", None)
+        task_name = kwargs.pop("__task_name", None)
+
+        if wf_id:
+            async with await WorkflowContext.from_kwargs(
+                {"__workflow_id": wf_id, "__task_name": task_name}
+            ) as ctx:
+                features = await ctx.get_upstream_output("featurize")
+                # ... train model ...
+
+        # NOTE: With a custom Processor you must send the completion
+        # yourself (or wrap with WorkflowShellCommandProcessor).
+```
+
+For custom processors, consider using `WorkflowShellCommandProcessor` as
+a reference for the completion-sending logic. `WorkflowContext` also has
+an async API for in-process access:
+
+```python
+async with await WorkflowContext.from_kwargs(kwargs) as ctx:
+    upstream = await ctx.get_upstream_output("preprocess")
+    outputs = await ctx.get_available_upstream_outputs()
+    cancelled = await ctx.is_cancelled()
+```
+
 ## Queueing and Running
 
 Rather than submitting tasks one by one using the CLI as shown in the basic example, you can implement the `ai4s.jobq.orchestration.WorkSpecification` protocol in Python to list all your tasks quickly.

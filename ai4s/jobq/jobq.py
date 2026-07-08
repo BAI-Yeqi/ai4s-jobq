@@ -22,7 +22,14 @@ from typing import (
 import azure.core.exceptions
 from azure.core.credentials_async import AsyncTokenCredential
 
-from ai4s.jobq.entities import LockLostError, Response, Task, WorkerCanceled
+from ai4s.jobq.entities import (
+    LockLostError,
+    Response,
+    RetryableTaskFailure,
+    Task,
+    WorkerCanceled,
+    WorkflowTaskGivenUp,
+)
 
 from .backend.common import JobQBackend, JobQBackendWorker
 
@@ -378,6 +385,75 @@ class JobQ:
                     },
                 )
                 raise
+            except RetryableTaskFailure as e:
+                await envelope.cancel_heartbeat()
+                lock_lost = envelope.lock_lost_event.is_set()
+                duration = time.time() - start_time
+                if lock_lost:
+                    LOG.warning(
+                        f"Lock lost for task {task.id} during retryable failure — "
+                        f"abandoning without settlement (another worker will handle it).",
+                        extra={
+                            "duration_s": duration,
+                            "task_id": task.id,
+                            "event": "task_lock_lost",
+                        },
+                    )
+                    raise LockLostError(
+                        f"Lock lost for task {task.id} after {duration:.1f}s"
+                    ) from e
+                LOG.info(
+                    f"Task {task.id}: retryable failure ({e}); requeueing without "
+                    f"consuming jobq retry budget.",
+                    extra={
+                        "duration_s": duration,
+                        "task_id": task.id,
+                        "event": "task_retry_external",
+                    },
+                )
+                try:
+                    await envelope.replace(task)
+                except Exception:
+                    LOG.warning(
+                        "Failed to replace task %s for retry (message will be "
+                        "re-delivered after the lock expires).",
+                        task.id,
+                        exc_info=True,
+                    )
+                return False
+            except WorkflowTaskGivenUp as e:
+                await envelope.cancel_heartbeat()
+                lock_lost = envelope.lock_lost_event.is_set()
+                duration = time.time() - start_time
+                if lock_lost:
+                    LOG.warning(
+                        f"Lock lost for task {task.id} during give-up — "
+                        f"abandoning without settlement (another worker will handle it).",
+                        extra={
+                            "duration_s": duration,
+                            "task_id": task.id,
+                            "event": "task_lock_lost",
+                        },
+                    )
+                    raise LockLostError(
+                        f"Lock lost for task {task.id} after {duration:.1f}s"
+                    ) from e
+                LOG.error(
+                    f"Task {task.id} given up by processor: {e}",
+                    extra={
+                        "duration_s": duration,
+                        "task_id": task.id,
+                        "event": "task_give_up",
+                    },
+                )
+                if task.reply_requested:
+                    with suppress(Exception):
+                        await envelope.reply(Response(is_success=False, body=str(e)))
+                try:
+                    await envelope.delete(success=False, error=str(e))
+                except Exception:
+                    LOG.warning("Failed to delete given-up task %s.", task.id, exc_info=True)
+                return False
             except Exception as e:
                 exc = e  # this roundabout way makes mypy happy.
                 execution_was_succesful = False
