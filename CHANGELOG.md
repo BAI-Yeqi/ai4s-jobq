@@ -1,0 +1,1240 @@
+CHANGELOG
+=========
+
+3.14.0 (2026-07-07)
+-------------------
+
+Features:
+
+* **New DAG-based workflow orchestration module.** JobQ now ships
+  ``ai4s.jobq.workflow`` for dependency-aware task execution on top of
+  the existing queue backends. Define a DAG of tasks with
+  ``depends_on`` edges, submit it, and let a coordinator dispatch each
+  task once its upstream tasks complete. Highlights:
+
+  * **CLI.** New ``ai4s-jobq workflow`` subcommands: ``submit``,
+    ``validate``, ``status``, ``watch``, ``logs``, ``list``,
+    ``tasks``, ``cancel``, ``retry``, ``coordinator``, ``summary``,
+    ``purge``, ``doctor``, ``explain``, and ``track``.
+  * **Python API.** ``WorkflowClient`` (async context manager) with
+    ``submit``, ``submit_batch``, ``status``, ``watch``, ``cancel``,
+    ``retry``, ``list_workflows``, ``list_tasks``, ``summary``, and
+    ``purge``.
+  * **User-script context.** ``set_output``, ``get_upstream_output``,
+    ``get_upstream_outputs``, ``is_cancelled``, and
+    ``get_real_upstream_tasks`` for tasks to publish results and read
+    upstream outputs. Large outputs are transparently stashed in blob
+    storage.
+  * **Conditional execution.** Tasks can declare a ``condition``
+    expression (for example ``all(upstream_succeeded)``,
+    ``almost_all(0.9)``, ``count(succeeded) >= 3``); tasks whose
+    condition is false are skipped and propagate ``UPSTREAM_FAILED`` to
+    their children.
+  * **Large fan-in support.** ``workflow submit --max-fan-in`` and the
+    ``sequentialize_fan_in()`` helper restructure high-fan-in subgraphs
+    into bounded sequential batches so workflows with thousands of
+    roots stay within Azure Storage message limits.
+  * **Mixed and fully qualified queues.** Workflow queues accept
+    fully qualified names, and a single workflow can mix Azure Storage
+    Queue and Service Bus backends.
+  * **Live monitoring.** ``workflow watch`` renders colour-coded
+    per-layer progress bars with completion-rate and ETA, and the
+    optional ``track`` dashboard gains workflow graph, health, and
+    task-explorer views.
+  * **Coordinator resilience.** A single coordinator per prefix drives
+    retries (via ``attempt_no`` vs ``num_retries``), flushes runtime
+    state to an ETag-guarded blob, and runs a periodic ready-repair
+    sweep to recover tasks whose queue message was lost. ``workflow
+    doctor`` reports stuck workflows.
+
+  Configured via ``JOBQ_WORKFLOW_PREFIX`` (and related
+  ``JOBQ_WORKFLOW_*`` / ``JOBQ_COORDINATOR_*`` env vars). Install the
+  optional dashboard with ``pip install ai4s-jobq[track]``.
+
+3.13.1 (2026-06-10)
+-------------------
+
+Fixes:
+
+* **Workforce monitor: separate JSON-decode errors from transient transport failures.**
+  The monitor's exception handler logged every error (including
+  ``ServiceBusServerBusyError``) as "Could not json-decode message" and retried
+  immediately, tight-looping under throttling. ``json.JSONDecodeError`` now has
+  its own accurate handler, and all other exceptions are retried with an
+  exponential delay (capped at one minute, reset after a successful receive). (#93)
+
+3.13.0 (2026-06-10)
+-------------------
+
+Features:
+
+* **Pin ACR image tags to content digests at hire time.**
+  New ``ImageDigestResolver`` (``ai4s.jobq.orchestration.image_resolver``)
+  resolves a ``registry/repo:tag`` reference to its immutable
+  ``registry/repo@sha256:...`` digest via the ``azure-containerregistry``
+  SDK and caches it under a TTL. ``Workforce`` and ``MultiRegionWorkforce``
+  take an optional ``image_resolver`` and rewrite ``env.image`` at hire
+  time, so every worker in a scheduler session pulls byte-identical image
+  content even if the tag is re-pushed mid-run. Opt-in, ACR-only
+  (``*.azurecr.io``), fail-open on registry errors. Adds an
+  ``azure-containerregistry`` dependency. (#73)
+
+Fixes:
+
+* **Avoid a registration race on digest-pinned anonymous environments.**
+  When the resolver rewrites ``env.image``, concurrent ``_build_worker``
+  calls produce the same content-hash anonymous AzureML environment and
+  race on registration, failing with ``ResourceExistsError``. The Workforce
+  now pre-registers the environment once under a lock, caches its ARM id,
+  and submits jobs against that id. (#73)
+
+3.12.3 (2026-06-09)
+-------------------
+
+Fixes:
+
+* **Prevent synchronized lock-loss from shared credential transport closure.**
+  ``get_token_credential()`` was decorated with ``@lru_cache``, returning
+  the same credential instance to all callers in a process. When the
+  workforce monitor exited its async context manager, it permanently closed
+  the shared HTTP transport—causing all workers to lose their Service Bus
+  locks simultaneously. Each call site now receives an independent credential
+  instance.
+
+* **Avoid preemption race that decremented retry count.**
+  When a subprocess exited non-zero during preemption (for example, after
+  checkpointing and raising), the task's retry count was incorrectly
+  decremented. The manager now preserves the retry count when the exit
+  coincides with a pending preemption signal.
+
+CI:
+
+* **SHA-pin all GitHub Actions and add Dependabot for actions.**
+  Every workflow now uses full commit SHAs instead of mutable tags,
+  preventing supply chain attacks via tag rewriting. Dependabot is
+  configured to propose updates weekly.
+
+* **Verify requirements-ci.lock freshness in CI.**
+  A new lint step regenerates the lock file and fails if it drifts from
+  ``pyproject.toml``. A matching pre-commit hook auto-regenerates locally.
+
+3.12.2 (2026-05-27)
+-------------------
+
+Misc:
+
+* servicebus: increase lock renewal frequency and add more logging
+
+3.12.1 (2026-05-22)
+-------------------
+
+Fixes:
+
+* **Lock-loss now kills the affected subprocess immediately.**
+  After PR #59 removed the blast-radius ``_kill_subprocesses`` call from
+  ``ProcessPool.submit()``, a cancelled task's subprocess continued running
+  without any message lock—leading to duplicate execution when another
+  worker picked up the same message.  ``submit()`` now tracks the pool
+  child's PID via a temp file and sends ``SIGUSR2`` on ``CancelledError``.
+  The pool child responds by sending ``SIGKILL`` to the subprocess's
+  process group—no graceful shutdown, since the lock is already lost and
+  checkpointing would conflict. Preemption/shutdown still uses graceful
+  ``SIGTERM`` via ``SIGUSR1``.
+
+* **Suppress log queue error spam during shutdown.**
+  When the multiprocessing Manager is terminated during preemption or
+  SIGTERM, ``log_from_queue`` no longer retries indefinitely on
+  ``BrokenPipeError``/``ConnectionResetError``—it exits the loop
+  cleanly with a DEBUG message.
+
+* **Storage Queue: detect lock loss on sustained heartbeat failure.**
+  Previously, if heartbeat updates failed with non-HTTP errors (network
+  timeouts, DNS failures, connection resets), the heartbeat loop retried
+  indefinitely without declaring lock loss. Now tracks time since last
+  successful heartbeat; if it exceeds the visibility timeout, sets
+  ``lock_lost_event`` and logs a warning—matching the Service Bus
+  backend behavior.
+
+
+3.12.0 (2026-05-06)
+-------------------
+
+Features:
+
+* **Higher scaling tiers in ``MultiRegionWorkforce``.**
+  Added two new auto-scaling tiers: queues with more than 100_000 pending
+  tasks per worker now scale up to 5_000 workers, and queues above 50_000
+  scale up to 2_000 workers (previously capped at 1_000).
+
+* **``MultiRegionWorkforce`` opt-in parallel region reads.**
+  New constructor flag ``parallel_region_reads`` (default ``False``) fans out
+  the read-only per-region phases (``get_current_state``,
+  ``get_available_to_hire``, resume discovery) across a thread pool sized as
+  ``n // 5 + 1`` (cap 32). Writer phases stay outer-sequential. Measured ~11x
+  tick speedup on an 84-region fleet (~14.5 min -> ~1.3 min). Each tick now
+  logs a banner with uptime + gap-since-last, a ``summary`` and ``phases``
+  line, and per-phase summaries with slowest-3 + p50/max; per-region ``INFO``
+  lines are demoted to ``DEBUG``. Default behaviour is unchanged. (#66)
+
+
+3.11.1 (2026-04-29)
+------------------
+
+Fixes:
+
+* **Clarified lock-loss retry log message in ``launch_workers``.**
+  Changed wording from "not counted as failure" to "not counting as
+  failed" for consistency.
+
+
+3.11.0 (2026-04-29)
+-------------------
+
+Breaking changes:
+
+* **Removed legacy SAS-based queue authentication.**
+  The ``sas`` CLI command, ``JobQ.sas_token()`` method, and
+  ``generate_sas()`` backend protocol method have been removed. All
+  production deployments use ``DefaultAzureCredential`` / managed identity.
+  Connection-string authentication (``AccountKey``) for local development
+  with Azurite is unchanged. (Closes #14.)
+
+
+3.10.0 (2026-04-28)
+-------------------
+
+Features:
+
+* **Track dashboard improvements.**
+  Redesigned the ``ai4s-jobq track`` dashboard toolbar with a cleaner layout,
+  added time range presets (``6h``/``12h``/``24h``/``3d``/``7d``), configurable refresh interval,
+  and a group-by toggle to switch between overall and per-environment
+  breakdowns in Active Workers, CPU, RAM, Preemptions, and Tasks Started panels.
+  Disabled the Plotly toolbar on all graphs and added a per-graph expand button
+  (⛶) for fullscreen inspection (press Escape to close).
+
+* **New stat cards.**
+  Added big-number stat cards showing succeeded/failed per day,
+  succeeded/failed per worker-day (normalized for worker uptime),
+  average time to success, and average time to failure.
+
+* **Daily moving average panel.**
+  New trend line showing a 24-hour rolling average of task completions and failures.
+
+* **Fan charts for resource utilization.**
+  Task runtimes, CPU utilization, and RAM utilization panels now render as fan
+  charts with percentile bands (p10–p90, p25–p75) when in overall grouping mode,
+  giving a clearer picture of distribution over time.
+
+* **Workforce monitoring section.**
+  New dedicated section with panels for worker churn (arrivals vs departures),
+  worker lifetime distribution, average time to preemption by environment
+  (top and bottom 10), and tasks-per-preemption efficiency ratio. Active
+  workers and active environments panels moved into this section.
+
+* **Workspace auto-detection.**
+  The dashboard now detects all AML workspaces associated with the selected
+  queue and displays them in the toolbar. The workspace filter was removed from
+  data queries since a single queue can span multiple workspaces.
+
+Bug fixes:
+
+* Fixed queue dropdown resetting to the CLI value on every callback refresh.
+* Fixed tasks completed/failed graph showing swapped colors (Succeeded was
+  plotted as red, Failed as green).
+* Fixed failure double-counting caused by combining AppTraces and AppExceptions
+  (each failure was counted twice).
+* Fixed date format bug (``%Y-%M-%D`` → ``%Y-%m-%d``).
+* Fixed pandas ``ChainedAssignmentError`` in the errors panel.
+* Fixed worker churn panel crash when the KQL response had fewer columns than
+  expected.
+* **ProcessPool no longer deadlocks when the parent has background threads.**
+  Both ``ProcessPool._create_pool()`` and the ``multiprocessing.Manager``
+  used for log forwarding now use the ``forkserver`` start method instead of
+  the default ``fork``. With ``fork``, child processes inherit the parent's
+  memory—including C-level locks held by native extensions such as the Azure
+  SDK (MSAL token cache), OpenSSL, or ``aiohttp`` connection pools. Because
+  the owning thread does not exist in the child, any code path that acquires
+  such a lock deadlocks. Python 3.12 made standard-library locks fork-safe,
+  but C-extension locks remain vulnerable. ``forkserver`` avoids the problem
+  by forking children from a clean, single-threaded server process. On
+  Windows, ``spawn`` is used instead (``forkserver`` is not available). This
+  fix is relevant for any deployment where ``ProcessPool`` workers run
+  alongside Azure SDK credentials or other native libraries with background
+  threads.
+
+
+3.9.2 (2026-04-24)
+------------------
+
+Fixes:
+
+* **Lock-loss no longer kills all running tasks.**
+  ``ProcessPool._kill_subprocesses`` previously sent SIGUSR1 to **every**
+  pool child when any single task was cancelled (for example, due to a
+  Service Bus message lock expiry).  This meant that one transient lock
+  failure would terminate all concurrently running tasks—not just the
+  affected one.  ``ProcessPool.submit()`` no longer calls
+  ``_kill_subprocesses`` on individual ``CancelledError``.  Instead, a
+  new ``Processor.shutdown()`` / ``ProcessPool.kill_all_subprocesses()``
+  method is called explicitly by the orchestration layer during
+  coordinated shutdown (preemption, time-limit).  Individual task
+  cancellations now only discard the cancelled task's result; other
+  tasks continue unaffected.
+
+
+3.9.1 (2026-04-23)
+------------------
+
+Fixes:* **``Workforce.get_compute_infos`` accepts either a bare compute name
+  or a full ARM resource id on ``Command.compute``.** The ARM ``GET
+  /computes/{name}`` URL template requires the bare name, but the
+  attribute can legally hold either form: a user may configure it as a
+  full id, and ``MLClient.jobs.create_or_update`` rewrites a bare name
+  to the full id as a side effect of submission. Previously, every
+  workforce started returning ``RuntimeError("Failed to fetch cluster
+  information …")`` from its second tick onward because the URL
+  substitution produced a malformed double-nested path (``…/computes//
+  subscriptions/…/computes/name``). In
+  :class:`~ai4s.jobq.orchestration.multiregion_workforce.MultiRegionWorkforce`
+  the broken call was caught as ``assuming 0 capacity``, so autoscaling
+  silently stopped hiring for the rest of the process lifetime even
+  while hiring itself still worked. ``get_compute_infos`` now takes
+  the last ``/``-separated segment of ``Command.compute`` before
+  templating. The resulting ``RuntimeError`` on failure also now
+  includes the HTTP status code and reason so the same failure mode
+  surfaces immediately in logs.
+
+* **``Workforce.hire`` no longer submits the prototype ``Command`` by
+  reference.** ``MLClient.jobs.create_or_update`` resolves short
+  references on the object it is given in place (``compute``,
+  ``environment``, ``code``), so sharing ``self._job`` across
+  submissions let the SDK mutate the prototype—the trigger that
+  poisoned ``self._job.compute`` for later ``get_compute_infos`` reads.
+  ``hire`` now routes through :meth:`_build_worker` like
+  ``parallel_hire``, using a shallow copy per submission. As a
+  side effect this fixes an operator-precedence bug where
+  ``APPLICATIONINSIGHTS_CONNECTION_STRING`` was propagated as the
+  ``True`` / ``False`` result of the presence check instead of the
+  actual connection string.
+
+
+3.9.0 (2026-04-23)
+------------------
+
+Features:
+
+* **``Workforce`` parallel hire / lay off / resume.**
+  Added ``parallel_hire``, ``parallel_lay_off``, ``resume``, and
+  ``parallel_resume`` methods to :class:`Workforce`, mirroring the
+  existing ``hire`` / ``lay_off`` signatures. The ``parallel_*`` variants
+  use a thread pool (``workers=8`` by default) and surface a Rich progress
+  bar when ``progress=True`` (default). Individual submission / cancel /
+  resume failures are logged as warnings and do not abort the batch.
+  ``resume`` uses the MFE execution REST API (the AzureML ARM API does
+  not expose resume). The sequential ``hire`` and ``lay_off`` methods
+  also gained a ``progress: bool = True`` keyword argument with the same
+  progress bar, so long-running sequential runs no longer appear frozen.
+
+  For thread safety, ``parallel_hire`` builds each worker from a shallow
+  copy of the prototype ``Command`` with a fresh ``environment_variables``
+  dict, so concurrent submissions no longer race on shared attributes.
+
+  ``_resume_one`` retries transient 5xx responses (including the
+  ``500``-wrapped ``503 DatabaseOverCapacity`` returned by Singularity's
+  CJP under heavy load) up to three times, honoring ``Retry-After`` /
+  ``x-ms-retry-after-ms`` with exponential-backoff fallback.
+
+  ``lay_off`` (and ``parallel_lay_off``) now prefer to cancel ``Paused``
+  jobs first (followed by ``Queued``, ``Waiting``, ``Preparing``,
+  ``Starting``, then ``Running``). Paused jobs on Singularity have
+  typically already hit the max-execution-time cap and cannot be
+  resumed, so cancelling them is the only way to free the slot; active
+  states are cancelled last to avoid discarding in-flight work.
+
+  ``hire`` and ``parallel_hire`` now tolerate the AzureML
+  ``JobPropertyImmutable`` error on our own freshly generated job names.
+  This error is only reachable via the azure-core transport retry
+  policy re-sending a ``create_or_update`` whose first attempt already
+  succeeded server-side, so the job *is* created even though the client
+  sees a failure. The retry race is now detected and treated as
+  success. Previously the sequential ``hire`` loop had no
+  per-iteration error handling, so a single such race would abort the
+  entire batch.
+
+* **``MultiRegionWorkforce`` parallel hires and per-tick resume.**
+  MRW now loops regions sequentially and delegates to
+  ``Workforce.parallel_hire`` / ``parallel_lay_off`` (8 threads
+  internally). This better handles uneven hiring distributions: a
+  region that needs 5 hires no longer blocks one that needs 500.
+  Applies uniformly to ``run()``, ``run(scale_to_zero=True)``,
+  ``run(manual_hire=n)`` (new ``_apply_uniform_change`` helper), and
+  ``layoff_queued_workers``.
+
+  ``run()`` now resumes paused workers in every region at the end of
+  each tick via a new ``_resume_all_regions`` helper. This is cheap
+  when nothing is paused (one ``list_jobs`` per region) and prevents
+  the running pool from bleeding away on Singularity where jobs hit
+  max-execution-time caps between ticks.
+
+* **``Workforce.parallel_hire_in_batches`` and MRW
+  ``batched_delay_in_hiring`` flag.**
+  New ``Workforce.parallel_hire_in_batches(n, batch_size=512,
+  delay=10.0)`` method splits ``n`` hires into fixed-size batches,
+  dispatches each batch through ``parallel_hire`` (preserving the
+  existing first-hire artifact priming, 8-thread pool, and progress
+  bar), and sleeps ``delay`` seconds between batches. Avoids
+  overloading the AzureML MFE / container registry on very large
+  hires. ``MultiRegionWorkforce`` gained a ``batched_delay_in_hiring:
+  bool = True`` constructor argument; when set (default), every MRW hire
+  path routes through ``parallel_hire_in_batches`` instead of a
+  single ``parallel_hire`` burst. Lay-off and resume paths are
+  unchanged.
+
+Fixes / resilience:
+
+* **``Workforce.list_jobs`` retries transient 5xx / 429 responses.**
+  The AzureML index endpoint behind ``ml.azure.com`` occasionally
+  returns raw nginx 503 HTML during regional load spikes. ``list_jobs``
+  now retries up to ``_LIST_JOBS_MAX_RETRIES=3`` times, honoring
+  ``Retry-After`` / ``x-ms-retry-after-ms`` with exponential-backoff
+  fallback (same helper already used by ``_resume_one``). Previously
+  any non-200 response aborted ``get_current_state`` / ``get_detailed_state``
+  / scaling with a ``RuntimeError``.
+
+* **``Workforce`` retries network-level request errors.**
+  A new ``_request_with_retry`` helper wraps ``list_jobs`` and
+  ``get_compute_infos`` so transient ``requests.RequestException``
+  errors (DNS ``NameResolutionError``, connection resets, timeouts)
+  are now retried with the same Retry-After / back-off logic as HTTP
+  5xx / 429. Previously these errors bypassed the HTTP retry loop and
+  propagated up to the per-region fallback on the first failure.
+
+* **``Workforce.get_compute_infos`` retries and is timed.**
+  ``get_available_to_hire`` calls the ARM management API, which has
+  been observed to stall silently for tens of seconds on heavily
+  loaded workspaces. ``get_compute_infos`` now goes through the same
+  retry helper and MRW logs per-region wall-clock for the capacity
+  query, so ticks no longer appear to hang between "Scaling to X"
+  and the first hire.
+
+* **``MultiRegionWorkforce.states`` tolerates per-region failures.**
+  If ``get_current_state`` raises for a single region (for example, retries
+  exhausted), MRW now falls back to that workforce's last-known-good
+  state cached in ``_last_good_state``, or to a zero ``State`` if no
+  successful reading exists yet. One flaky region no longer aborts
+  the whole autoscaling tick.
+
+* **Lock-loss events no longer count as consecutive failures.**
+  Added ``LockLostError`` exception for Service Bus lock-loss events
+  (expired locks, 404 on renewal). Previously these were counted as
+  consecutive failures, eventually shutting down healthy workers. The
+  worker now skips the failure counter and continues to the next task.
+
+* **Lock duration no longer drops to 30 s after first renewal.**
+  The renewal loop was overwriting its lock duration with the value
+  returned by ``renew_lock()``, but the Service Bus REST API returns
+  empty ``BrokerProperties`` on renewal responses, causing a fallback
+  to the 30 s default. The original lock duration from the initial
+  peek-lock is now kept for the entire renewal loop lifetime.
+
+* **Orphaned child processes no longer hang workers.**
+  Rewrote the orphan detection to poll ``process.returncode`` instead
+  of ``os.waitpid(WNOHANG)``, which raced with asyncio's
+  ``ThreadedChildWatcher``. Added a drain timeout with process group
+  termination for inherited-pipe scenarios.
+
+* **SIGKILL escalation for unresponsive subprocesses.**
+  When a subprocess ignores SIGTERM, the worker now escalates to
+  SIGKILL after ``JOBQ_KILL_TIMEOUT`` seconds (default: 600). Each
+  subprocess runs in its own process group so the signal reaches all
+  descendants without affecting the worker.
+
+Internal / observability:
+
+* **Richer ``Workforce`` progress bars.**
+  Progress bars (``hire``, ``parallel_hire``, ``lay_off``,
+  ``parallel_lay_off``, ``resume``, ``parallel_resume``) now show
+  percent complete, a live items-per-second ``_RateColumn``, live
+  ``✓`` / ``✗`` counters inside the description, and the workforce's
+  experiment name so bars are self-identifying when a caller loops
+  over many regions. Columns are unified across sequential and
+  parallel variants via a new ``_make_progress`` helper.
+
+* **Per-region MRW logs.**
+  ``run()`` now logs a ``Tick start`` line, marks every region with
+  ``[i/N] name:``, emits per-region wall-clock timings for state
+  fetch, capacity query, hire, and resume phases, and closes each
+  tick with a summary (``Tick done across K region(s) in Ys: hired
+  X/Y``). The same structure applies to scale-to-zero, manual
+  hire / lay-off, and the paused-worker resume pass.
+
+* **Rich console sharing between progress bar and log handler.**
+  The progress bar and ``RichHandler`` now share a single ``Console``
+  instance, preventing interleaved output.
+
+* **Timestamp diagnostics for live Service Bus tests.**
+  Added timestamps to all live tests for easier debugging of
+  timing-sensitive scenarios.
+
+* **Fixed graceful shutdown test failures.**
+  Fixed subprocess ``env`` dict not inheriting the parent environment,
+  and fixed assertions broken by Rich line-wrapping of long log
+  messages.
+
+
+3.8.0 (2026-04-21)
+------------------
+
+Fixes:
+
+* **Service Bus ``replace()`` no longer causes message buildup.**
+  The previous implementation sent a new message without deleting the old one,
+  causing the queue to grow with every task failure. ``replace()`` is now a
+  no-op on Service Bus—the message is re-delivered with its original content
+  after the lock expires. Storage Queue behavior is unchanged (atomic
+  in-place update).
+
+
+3.7.1 (2026-04-17)
+------------------
+
+Fixes:
+
+* **Fix Service Bus REST ``peek_messages()`` using AMQP SDK.**
+  The REST API ``peekonly=true`` parameter behaves inconsistently across
+  Service Bus namespace tiers—on some it returns 404, on others it
+  silently locks the message instead of peeking. Replaced with the native
+  AMQP-based ``ServiceBusReceiver.peek_messages`` for true non-destructive
+  peek (no locks, no delivery-count increment).
+
+* **Retry transient 404 in ``peek_lock_message()``.**
+  After queue operations the Service Bus data-plane may briefly return 404.
+  ``peek_lock_message`` now retries up to 3 times with a 2 s back-off.
+
+Internal:
+
+* **Enable strict linting, type checking, and CI hardening.**
+  Added 25+ ruff rule groups, strict mypy configuration, split CI into
+  lint / test / docs jobs, added PR review workflow and CODEOWNERS.
+
+* **Add doc8, markdownlint, and Vale documentation linters.**
+  Added three documentation linters as pre-commit hooks and a CI job:
+  doc8 for RST structure, markdownlint for Markdown formatting, and Vale
+  for prose style (Google style base with custom JobQ rules and vocabulary).
+  Fixed all existing lint issues including Latin abbreviation replacements,
+  em-dash spacing, typos, and heading hierarchy.
+
+3.7.0 (2026-04-16)
+------------------
+
+Breaking changes:
+
+* **Rename ``Workforce.State.num_queued`` → ``num_pending``.**
+  The field now accurately reflects that it counts all non-running active jobs
+  (Queued, Preparing, Paused, Starting, Waiting), not just queued ones.
+  Consumers accessing ``.num_queued`` on ``State`` must update to ``.num_pending``.
+
+Features:
+
+* **Add ``DetailedState`` with per-status breakdowns.**
+  New ``DetailedState(State)`` subclass exposes ``num_paused``, ``num_queued``,
+  ``num_preparing``, ``num_starting``, and ``num_waiting`` fields.
+  Retrieve via ``Workforce.get_detailed_state()`` at no extra API cost.
+
+3.6.1 (2026-04-16)
+------------------
+
+Fixes:
+
+* **Suppress OTel exporter log spam after preemption.**
+  Set the ``azure.monitor.opentelemetry.exporter.export._base`` logger to
+  ``CRITICAL`` so that failed telemetry exports no longer flood user logs
+  with tracebacks when the AppInsights endpoint is unreachable.
+
+3.6.0 (2026-04-09)
+------------------
+
+Feature:
+
+* **Reduce noise when scheduling.**
+  ``batch_enqueue()`` now logs queue-completion and worker-join messages at
+  ``DEBUG`` level instead of ``INFO`` when ``show_progress`` is disabled.
+
+* **Improve Azure Monitor configuration.**
+  Suppress ``AppDependencies`` table noise with ``sampling_ratio=0.0``,
+  disable performance counters and live metrics by default, find the Azure
+  Add exception filtering to ``CustomDimensionsFilter`` to redirect
+  exceptions from ``AppExceptions`` to ``AppTraces``.
+
+3.5.0 (2026-04-07)
+------------------
+
+Fixes:
+
+* **ServiceBus REST: non-blocking pool shutdown during preemption.**
+  ``ProcessPool._kill_subprocesses`` now runs ``pool.shutdown(wait=True)``
+  in a thread executor instead of blocking the asyncio event loop. This
+  keeps lock-renewal tasks and heartbeats alive while waiting for pool
+  processes to exit, preventing message-lock expiration on the ServiceBus
+  REST backend (5-minute lock duration).
+
+* **ServiceBus REST: ``deadletter_message()`` timeout and error handling.**
+  The one-off AMQP connection opened for dead-lettering now has a 30-second
+  timeout and catches all errors instead of letting a hung or failed AMQP
+  connection break the worker.
+
+* **Resilient ``requeue()`` on worker cancellation.**
+  A failed ``requeue()`` call (for example, expired lock) inside the
+  ``WorkerCanceled`` handler no longer replaces the exception and kills
+  the worker—the error is logged and the cancellation flow continues.
+
+* **Non-blocking ``ProcessPool.__aexit__``.**
+  Final pool shutdown in ``__aexit__`` also runs via ``run_in_executor``
+  for consistency.
+
+3.4.0 (2026-03-30)
+------------------
+
+Features:
+
+* Listen for preemptions on native Azure Batch.
+
+3.3.0 (2026-03-24)
+------------------
+
+Features:
+
+* Set `job_url` from environment variable if not running on azureml, so that the grafana dashboard links to the correct job details page even for non-azureml jobs.
+* Moved ``worker_id`` and other per-call logging extras into
+  ``CustomDimensionsFilter`` so they are automatically attached to every log
+  record. A new ``set_custom_dimensions()`` helper in ``logging_utils``
+  lets callers register process-wide dimensions once instead of threading
+  them through every ``extra={…}`` dict.
+
+* Added ``set_context_dimensions()`` for per-coroutine logging dimensions
+  using ``contextvars``.
+
+* ``CustomDimensionsFilter`` is now always attached to the ``LOG`` and
+  ``TASK_LOG`` loggers (previously it was only created when an Application
+  Insights connection string was present).
+
+Fixes:
+
+* Each async worker now gets a unique ``worker_id``
+  (``<node_id>:<idx>`` when ``num_workers > 1``) so log records can be
+  attributed to individual workers rather than just the node.
+
+3.2.0 (2026-03-20)
+------------------
+
+Features:
+
+* Include ``azureml_workspace_name`` in Application Insights custom dimensions
+  even when ``AZUREML_RUN_ID`` is not set (for example, AzureML batch jobs), so
+  Grafana dashboards can filter by workspace for all job types.
+
+Fixes:
+
+* Handle ``tenacity.RetryError`` in the worker heartbeat so that transient
+  failures in ``get_approximate_size()`` no longer kill the heartbeat task
+  (previously surfaced as "Task exception was never retrieved").
+
+* Increase retry attempts for ``get_approximate_size()`` from 3 to 10 to
+  better tolerate transient Service Bus admin API failures.
+
+3.1.0 (2026-03-19)
+------------------
+
+Features:
+
+* Added GitHub Copilot skill support. A CLI reference and documentation
+  bundle is now auto-installed to ``~/.copilot/skills/ai4s-jobq-cli/`` on
+  first invocation, giving Copilot rich context about every ``ai4s-jobq``
+  subcommand.
+
+* New ``copilot-skill`` CLI subcommand group (``install``, ``clear``,
+  ``list``) for manual skill management.
+
+* New ``scripts/build_skill.py`` build script that generates ``SKILL.md``
+  from the asyncclick command tree and bundles Sphinx-built documentation
+  references into the package.
+
+* ``BACKEND_SPEC`` is now optional for the top-level CLI group, allowing
+  subcommands like ``copilot-skill`` to run without a queue connection.
+
+Fixes:
+
+* Fixed inconsistent ``queue`` property in Application Insights logs.
+  ``LOG.exception`` and ``LOG.info`` for task failures/retries explicitly set
+  ``queue`` to ``self.full_name`` (for example, ``livdft.servicebus.windows.net/…``),
+  overriding the ``sb://…`` format set by the ``CustomDimensionsFilter``.
+  Removed the redundant overrides so all log events use the same short format.
+
+
+3.0.2 (2026-03-19)
+------------------
+
+Fixes:
+
+* Fixed dead-lettering in the Service Bus REST backend. The REST API does
+  not support explicit dead-lettering—the previous implementation silently
+  abandoned messages instead, causing them to cycle back into the main queue
+  until ``MaxDeliveryCount`` was hit. Dead-lettering now uses a one-off AMQP
+  management link to settle the message using the lock token already held by
+  the REST peek-lock, which is atomic and race-free.
+
+* New queues are now created with ``max_delivery_count=1000`` to prevent
+  Service Bus auto-dead-lettering from interfering with application-level
+  retry logic.
+
+
+3.0.1 (2026-03-17)
+------------------
+
+Fixes:
+
+* Fixed retry logic in ``ServiceBusRestBackend.__len__``: the ``AttributeError``
+  raised when Azure returns ``None`` for ``message_count_details`` is now caught
+  and converted to a retryable ``None`` result, so ``tenacity`` actually retries
+  instead of immediately propagating the exception.
+
+* Fixed ``_CachedTokenCredential`` closing the caller-owned credential transport.
+  ``__aenter__``/``__aexit__`` no longer delegate to the wrapped credential,
+  preventing "HTTP transport has already been closed" errors when the same
+  credential is reused across multiple ``ServiceBusRestBackend`` context entries.
+
+
+3.0.0 (2026-02-24)
+------------------
+
+Breaking changes:
+
+* Service Bus queues are now created with duplicate detection enabled
+  (``requires_duplicate_detection=True``) and a 7-day detection window.
+  Existing queues must be deleted and recreated to benefit from deduplication.
+
+Features:
+
+* Task IDs are now deterministic by default (``JOBQ_DETERMINISTIC_IDS=true``).
+  Identical tasks produce the same ID (MD5 of serialized content), enabling
+  Service Bus duplicate detection to silently drop re-submitted tasks.
+
+* A warning is now logged on startup when the queue's duplicate detection
+  setting does not match the ``JOBQ_DETERMINISTIC_IDS`` configuration—in
+  either direction.
+
+* Application Insights with RBAC authentication is now supported. The credential
+  validation now uses the correct ``https://monitor.azure.com/.default`` scope.
+
+* Added retry logic for ``get_queue_runtime_properties`` in the Service Bus REST
+  backend to handle transient ``None`` responses that could cause ``AttributeError``.
+
+* Changed log format to ``YYYY-MM-DD HH:MM:SS LEVEL: message [logger]`` for better
+  readability and consistency.
+
+
+Fixes:
+
+* Fixed MLflow import error when using Azure ML tracking URIs by setting
+  ``MLFLOW_REGISTRY_URI`` to empty before import, preventing the
+  ``UnsupportedModelRegistryStoreURIException``.
+
+
+2.17.0 (2026-02-12)
+-------------------
+
+Features:
+
+* **Service Bus backend rewritten from AMQP to REST.** The previous AMQP-based
+  backend (`servicebus.py`) has been replaced with a new HTTP/REST implementation
+  (`servicebus_rest.py`) for improved stability. The new backend uses `aiohttp`
+  with `tenacity` for automatic retries of transient errors.
+
+* When a message lock is lost (Service Bus 404 or Storage Queue pop receipt mismatch),
+  the running task is now automatically cancelled and the worker moves on without
+  settling the message, avoiding duplicate processing.
+
+* Lock-loss detection added to the Storage Queue backend: heartbeat renewal failures
+  with HTTP 400/404 now signal lock loss via the new `lock_lost_event` on `Envelope`.
+
+Breaking changes:
+
+* The `[servicebus]` pip extras group has been removed; `azure-servicebus` is now
+  a core dependency.
+* `tenacity` is now a core dependency.
+
+Fixes:
+
+* fix ANSI escape codes breaking subprocess output assertions in CLI tests
+
+2.16.2 (2026-01-27)
+-------------------
+
+* catch ProcessLookupError when process we want to kill already ended
+
+2.16.1 (2026-01-22)
+------------------
+
+* fix an error for workers running on MacOS
+
+
+2.16.0 (2026-01-09)
+------------------
+
+* make multiregion workforce compatible with service bus backend
+
+
+2.15.1 (2026-01-08)
+-------------------
+
+* fix(servicebus): queue creation was attempted after first access, causing a crash
+
+2.15.0 (2025-12-23)
+-------------------
+
+* feat(backends): new servicebus backend
+
+2.14.0 (2025-12-04)
+-------------------
+
+* feat(logging): authenticate appinsights if token credential available (#15)
+* fix(track): ensure CLI queue is selected at startup (#16)
+* doc(api): improved ordering for new users (#17)
+
+2.13.1 (2025-11-06)
+-------------------
+
+Fix:
+
+* Collect exceptions from `ThreadPoolExecution`
+* Azureml job could not be copied and failed silently
+
+2.13.0 (2025-11-05)
+-------------------
+
+Features:
+
+* Workforce now has a function `get_available_to_hire`, which determines how many workers can be hired for azureml clusters. This can be used for smarter scheduling.
+* Multiregion-Workforce: instead of calculating `available_to_hire` itself for AML clusters, it now uses the unified `Workforce.get_available_to_hire`
+
+
+2.12.0 (2025-11-04)
+-------------------
+
+Features:
+
+* force flush messages to app insights when canceled
+
+
+2.11.1 (2025-10-21)
+-------------------
+
+Fixes:
+
+* in track, tz-aware and tz-unaware datetimes were subtracted
+
+2.11.0 (2025-10-10)
+-------------------
+
+Features:
+
+* When `--time-limit` is reached, initiate a clean shutdown sequence where tasks are signaled SIGTERM
+  and can checkpoint.
+
+2.10.0 (2025-09-26)
+-------------------
+
+Features:
+
+* Storage queue backend now supports a dead letter queue
+* Apply custom dimensions filter to azure log analytics logging, which adds job/worker meta data to each log line.
+* Expose logging setup for SDK (not CLI) users via `ai4s.jobq.setup_logging`.
+
+2.9.0 (2025-09-05)
+-------------------
+
+Features:
+
+* the workforce monitor now supports two shutdown modes: `do-not-accept-new-tasks` and `graceful-downscale`.
+  In `do-not-accept-new-tasks` mode, the monitor will wait until all workers are idle before shutting down.
+  This is useful when you want to scale down without interrupting running tasks. In case of `graceful-downscale`, the monitor will send `SIGTERM` to all running workers, and wait some time so that they can write a checkpoint before being killed.
+  To use this mode, set the environment variable `JOBQ_WORKFORCE_SHUTDOWN_MODE=graceful-downscale`.
+
+Fixes:
+
+* workforce monitor task did not cancel when the queue was empty
+
+
+2.8.0 (2025-08-26)
+-------------------
+
+Features:
+
+* add feature to workforce to automatically create service bus topic and subscription if parameters are provided
+* add feature to multiregion workforce to scale down by laying off queued workers
+
+
+2.7.0 (2025-07-18)
+-------------------
+
+Features:
+
+* Implemented workforce monitor to listen and handle the incoming workforce control events from the service bus.
+* Implemented support for graceful downscale events.
+
+2.6.1 (2025-07-18)
+------------------
+
+Features:
+
+* fix parameter type mismatch in `timeout` parameter of `QueueClient.update_message` function
+
+2.6.0 (2025-07-16)
+------------------
+
+Features:
+
+* add jobq track UI
+
+2.5.4 (2025-07-15)
+------------------
+
+Features:
+
+* Add extras field to PreemptionEventHandler to allow visualisation in the grafana dashboard.
+
+
+2.5.3 (2025-07-10)
+------------------
+
+Features:
+
+* log metadata to log analytics for every record.
+* explicitly log `task_canceled` events to log analytics.
+* avoid line breaks in non-interactive environment
+
+
+2.5.2 (2025-06-26)
+------------------
+
+Fixes:
+
+* When an announced aml compute preemption does not occur, continue processing tasks.
+
+2.5.1 (2025-06-13)
+-------------------
+
+Fixes:
+
+* Jobs now sleep after preemption so that AML ends up ending the job and rescheduling it, instead of thinking it finished.
+* Clean up dangling tasks waiting for shutdown events
+
+Misc:
+
+* Add `ai4s.jobq.__version__` to the package, and print version info when starting workers.
+
+
+2.5.0 (2025-05-28)
+------------------
+
+Features:
+
+* Automatically set PYTHONUNBUFFERED=1 in the worker environment to ensure that all output is flushed immediately.
+  Note that this can be overwritten by the user by setting an empty value for this envvar when queueing a task.
+
+* New option `--emulate-tty/-t` for worker, that should fix buffering issues
+  even with third party / non-python programs in the user task.
+  Note that `sys.stdin.isatty()` will return `True` when this option is used,
+  so configurations for progress bars that rely on this to detect whether the task
+  is running interactively will not work as expected.
+
+
+2.4.1 (2025-06-05)
+-------------------
+
+Fixes:
+
+* Fixed unsupported operand type error in service bus backend
+
+
+2.4.0 (2025-06-03)
+------------------
+
+Features:
+
+* Poll for and handle preemption events on AML clusters (by polling AML endpoint).
+  For tasks, this unifies the preemption handling of Singularity and AML,
+  they just need to implement a SIGTERM handler.
+
+Fixes:
+
+* Only handle SIGTERM once in the worker process. This was broken when multiple
+  `ShellCommandProcessor`s were launched in parallel.
+
+* Add hard exit on second SIGINT (ctrl-c).
+
+* Ensure that all task outputs are logged (to aml/stdout) before closing the
+  logging queue and exiting the worker process.
+
+
+2.3.4 (2025-06-03)
+-------------------
+
+Fixes:
+
+* Fixed the incompatible type error in service bus backend
+
+2.3.3 (2025-05-30)
+-------------------
+
+Fixes:
+
+* Fixed the name of AMLT_DIRSYNC_EXCLUDE environment variable
+
+
+2.3.2 (2025-05-022)
+------------------
+
+* Add more information about the running AzureML job to worker logs.
+
+
+2.3.1 (2025-05-22)
+------------------
+
+Misc:
+
+* Add timestamps to log messages when not running in an interactive terminal
+
+2.3.0 (2025-05-06)
+------------------
+
+Features:
+
+* log when SIGTERM is received (for example, during preemption)
+
+2.3.0 (2025-05-07)
+------------------
+
+Features:
+
+* On preemption, make current task pop up in queue again, immediately.
+
+2.2.0 (2025-04-07)
+------------------
+
+Misc:
+
+* when job fails, send last 100 log lines to log workspace for dashboard
+
+2.1.0 (2025-04-04)
+------------------
+
+Features:
+
+* Allow specifying custom processor class on CLI
+
+2.0.0 (2025-03-26)
+------------------
+
+Potentially Breaking Change:
+
+* ShellCommandProcessor: Stop using login shells, since Singularity runs a lot of unwanted commands for login shells.
+  If you have to rely on a login shell, set JOBQ_USE_LOGIN_SHELL=true in your worker environment, though it's not recommended.
+
+  You may need to manually initialize conda in each command before you can conda activate an environment.
+
+
+1.13.1 (2025-02-25)
+-------------------
+
+Fixes:
+
+* fix bug that prevented jobs from reappearing in the queue after a worker is preempted.
+* tasks were sometimes canceled but not awaited, resulting in potentially unnecessary verbose/scary exits
+
+
+1.13.0 (2025-02-13)
+-------------------
+
+Fixes:
+
+* logging of number of succeeded/failed tasks to mlflow was incorrect when used with multiple asyncio workers per process. Now, the correct number of tasks is logged.
+
+1.12.0 (2025-01-29)
+-------------------
+
+Fixes:
+
+* change the logging settings to not log every http request
+
+1.11.1 (2025-02-07)
+-------------------
+
+Fixes:
+
+* prevent grafana heartbeat crash on DNS issues by handling corresponding exception
+
+1.11.0 (2025-01-23)
+-------------------
+
+Fixes:
+
+* service bus backend was broken in a few ways:
+
+  * concurrent queueing isn't supported, added lock
+  * service-side locking wasn't working, explicitly registered peek-locked messages
+
+* ai4s-jobq amlt: remove tmpfile after submit
+
+Features:
+
+* service bus backend allows to peek *all* messages, optionally in json format
+
+
+1.10.0 (2024-08-19)
+-------------------
+
+Misc:
+
+* remove jobq credential. Not bumping major version, since everyone is already successfully using the package without the credential due to changes in security policies.
+
+1.9.0 (2024-05-27)
+------------------
+
+Features:
+
+* pass `_worker_id` to user callback when the callback has a parameter with this name
+
+1.8.1 (2024-05-27)
+------------------
+
+Fixes:
+
+* Logging in `storage_queue` complained about unconverted argument
+
+1.8.0 (2024-05-18)
+------------------
+
+* Make heartbeat the default from CLI. Disable via `--no-heartbeat`.
+
+1.7.0 (2024-05-16)
+------------------
+
+Features:
+
+* `launch_workers` now provides the same logging as the CLI, to simplify the creation of 'number of active workers' dashboard plots.
+
+
+1.6.0 (2024-05-17)
+------------------
+
+Fixes:
+
+* allow workers to exit cleanly when an exception occurs during batch enqueue
+* add signal handling (this is not yet functional, waiting for AML to do their part)
+
+
+
+1.5.0 (2024-05-06)
+------------------
+
+Features:
+
+* New `download_folder` function in `blob.py`
+
+Fixes:
+
+* prepend a `cd` command to `cmd` in the ShellCommandLauncher to ensure correct working directory even if AML changed `/etc/profile`.
+
+1.4.1 (2024-04-25)
+------------------
+
+Fixes:
+
+* amlt subcommand did not join the subprocess
+
+1.4.0 (2024-04-19)
+------------------
+
+Features:
+
+* Simplify entry point when only sequential computing is needed
+* Inject jobq env vars into amlt config when using amlt subcommand
+* Allow authentication with user-assigned identity on AML clusters rather than keys
+
+1.3.0 (2024-04-16)
+------------------
+
+Features:
+
+* When bash is available, use it (as a login shell) to execute the command.
+  This allows `conda activate` etc to work provided it has been set up in the
+  bashrc.
+
+1.2.4 (2024-04-02)
+------------------
+
+Fixes:
+
+* Changed default authentication mechanism from `DefaultAzureCredential` to `AzureCliCredential`.
+
+1.2.3 (2024-04-02)
+------------------
+
+Fixes:
+
+* storage queue backend: race conditions when heartbeat got canceled
+1.2.3 (2024-04-03)
+
+------------------
+
+1.2.2 (2024-02-27)
+------------------
+
+Fixes:
+
+* storage queue backend: deleting tasks failed with error that "reply" is not implemented
+
+1.2.1 (2024-02-26)
+------------------
+
+Fixes:
+
+* `ai4s-jobq amlt` crashed when exposing`JOBQ_STORAGE` environment variable
+
+
+1.2.0 (2024-02-23)
+------------------
+
+Features:
+
+* Service Bus backend added. This allows waiting for job results and prepares
+  for `call_in_config` integration.
+
+1.1.0
+-----
+
+Fixes:
+
+* stricter type checking, fix some type hints
+
+Features:
+
+* new `upload_from_folder` method in `BlobContainer` that allows parallel uploads of files in the folder
+* simplified imports from top level package
+
+
+1.0.1
+-----
+
+Fixes:
+
+* any CLI `push` call or python `batch_enqueue()` call cleared the queue. Now, clearing is manual.
+* fixed CI test pipeline and tests.
+
+
+1.0.0
+-----
+
+Initial Release

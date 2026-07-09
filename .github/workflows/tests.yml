@@ -1,0 +1,114 @@
+name: Python package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Set up Python 3.12
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --require-hashes --no-deps -r requirements-ci.lock
+        python -m pip install --no-deps -e .
+    - name: Verify requirements-ci.lock is up-to-date
+      run: |
+        python -m pip install pip-tools
+        pip-compile --extra=dev --generate-hashes --output-file=requirements-ci.lock --strip-extras pyproject.toml
+        git diff --exit-code requirements-ci.lock || {
+          echo "::error::requirements-ci.lock is out of date. Run: pip-compile --extra=dev --generate-hashes --output-file=requirements-ci.lock --strip-extras pyproject.toml"
+          exit 1
+        }
+    - name: Ruff lint
+      run: ruff check --output-format=github .
+    - name: Ruff format check
+      run: ruff format --check .
+    - name: Mypy
+      run: mypy ai4s/ --no-namespace-packages
+
+  docs-lint:
+    name: Docs Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Set up Python 3.12
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.12'
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '20'
+    - name: Install linters
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install doc8 vale
+        npm install -g markdownlint-cli
+    - name: Download Vale styles
+      run: vale sync
+    - name: doc8 (RST)
+      run: doc8
+    - name: markdownlint (Markdown)
+      run: markdownlint '**/*.md' --ignore node_modules --ignore vale-styles
+    - name: Vale (prose style)
+      run: vale --minAlertLevel error docs/ README.md CONTRIBUTING.md SUPPORT.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        npm install azurite
+        ./node_modules/.bin/azurite-blob --skipApiVersionCheck --inMemoryPersistence --blobPort 10000 &
+        ./node_modules/.bin/azurite-queue --skipApiVersionCheck --inMemoryPersistence --queuePort 10001 &
+        python -m pip install --upgrade pip
+        python -m pip install -e ".[dev,workforce]"
+    - name: Test with pytest
+      run: |
+        pytest
+
+  docs:
+    name: Docs Accessibility
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Set up Python 3.12
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.12'
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e .[dev]
+        npm install -D pa11y-ci
+    - name: Test Docs Accessibility
+      run: |
+        bash ./scripts/check-docs-accessibility.sh

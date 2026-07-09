@@ -1,0 +1,49 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
+    hooks:
+    -   id: check-yaml
+    -   id: check-added-large-files
+        args: [--maxkb=500]
+    -   id: check-merge-conflict
+    -   id: detect-private-key
+-   repo: https://github.com/jazzband/pip-tools
+    rev: a57e31229427e727c6f8dbf8acdef162182c6931  # v7.5.3
+    hooks:
+      - id: pip-compile
+        name: pip-compile (CI lock)
+        args: [--extra=dev, --generate-hashes, --output-file=requirements-ci.lock, --strip-extras, pyproject.toml]
+        files: ^pyproject\.toml$
+        additional_dependencies: []
+-   repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy --no-namespace-packages ai4s/
+        language: system
+        types: [python]
+        # Only trigger when ai4s/ files change, but check the full tree
+        # so cross-module re-export and type errors are caught.
+        files: ^ai4s/
+        pass_filenames: false
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+-   repo: https://github.com/PyCQA/doc8
+    rev: d66cb70cb8fcb9dbc7f8d3192f38403e1d46b7c3  # v1.1.2
+    hooks:
+      - id: doc8
+-   repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: 586c3ea3f51230da42bab657c6a32e9e66c364f0  # v0.44.0
+    hooks:
+      - id: markdownlint
+-   repo: https://github.com/errata-ai/vale
+    rev: 27593b0e0e7eb8f0c2b7fae0d93fa1cfaabceb2f  # v3.13.0
+    hooks:
+      - id: vale
+        args: [--minAlertLevel, error]
+        types_or: [markdown, rst]
+        files: ^(docs/|README\.md|CONTRIBUTING\.md|SUPPORT\.md|SECURITY\.md|CODE_OF_CONDUCT\.md|CHANGELOG\.md)

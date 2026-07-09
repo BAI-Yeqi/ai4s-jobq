@@ -1,0 +1,15 @@
+{
+  "name": "featurize-and-train",
+  "default_queue": "default",
+  "tasks": [
+    {
+      "name": "featurize",
+      "kwargs": {"cmd": "python featurize.py"}
+    },
+    {
+      "name": "train",
+      "kwargs": {"cmd": "python train.py"},
+      "depends_on": ["featurize"]
+    }
+  ]
+}
