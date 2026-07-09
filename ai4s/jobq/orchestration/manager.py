@@ -34,15 +34,8 @@ from contextlib import AsyncExitStack, suppress
 from functools import wraps
 from itertools import chain
 
-from ai4s.jobq import (
-    EmptyQueue,
-    JobQ,
-    JobQFuture,
-    LockLostError,
-    Response,
-    WorkerCanceled,
-    WorkSpecification,
-)
+from ai4s.jobq.entities import EmptyQueue, LockLostError, Response, WorkerCanceled
+from ai4s.jobq.jobq import JobQ, JobQFuture
 from ai4s.jobq.logging_utils import (
     flush_app_insights,
     set_context_dimensions,
@@ -50,7 +43,7 @@ from ai4s.jobq.logging_utils import (
 )
 from ai4s.jobq.orchestration.workforce_monitor import workforce_monitor
 from ai4s.jobq.scheduled_events import PreemptionEventHandler
-from ai4s.jobq.work import EnqueueStats, Processor
+from ai4s.jobq.work import EnqueueStats, Processor, WorkSpecification
 
 LOG = logging.getLogger(__name__)
 TRACE = get_tracer("ai4s.jobq")
