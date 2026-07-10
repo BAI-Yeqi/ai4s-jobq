@@ -304,6 +304,20 @@ def register_callbacks(app) -> None:
             raise PreventUpdate
 
         workflow_id = (selected_workflow_id or "").strip() or (input_workflow_id or "").strip()
+
+        # In local preview mode there is typically a single workflow and no
+        # selection yet; auto-pick the first pending workflow so the graph
+        # renders immediately on page load.
+        if not workflow_id:
+            try:
+                candidates = run(store.list_workflows(status="pending", limit=1))
+                if not candidates:
+                    candidates = run(store.list_workflows(limit=1))
+                if candidates:
+                    workflow_id = candidates[0].workflow_id
+            except Exception:
+                LOG.debug("Failed to auto-select default workflow", exc_info=True)
+
         if not workflow_id:
             raise PreventUpdate
 
