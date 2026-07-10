@@ -1,9 +1,11 @@
-name: Publish Python 🐍 distribution 📦 to PyPI
+name: Publish Python 🐍 distribution 📦 to PyPI (DISABLED)
 
+# NEUTRALIZED for the internal msr-central fork: this repository must never
+# publish to public PyPI. Automatic push/tag triggers are removed and every
+# job is guarded with `if: false`. Internal releases are published to the
+# Azure DevOps Artifacts feed by a separate workflow.
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +13,7 @@ permissions:
 jobs:
   build:
     name: Build distribution 📦
+    if: false  # neutralized: never run on the internal fork
     runs-on: ubuntu-latest
 
     steps:
@@ -42,7 +45,7 @@ jobs:
   publish-to-pypi:
     name: >-
       Publish Python 🐍 distribution 📦 to PyPI
-    if: startsWith(github.ref, 'refs/tags/')  # only publish to PyPI on tag pushes
+    if: false  # neutralized: never publish to public PyPI from the internal fork
     needs:
     - build
     runs-on: ubuntu-latest
