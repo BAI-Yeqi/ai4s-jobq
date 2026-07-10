@@ -1,0 +1,87 @@
+name: Publish to MSR shared feed
+
+# Publishes the package to the MSR-wide shared Azure Artifacts feed (`msr`) via
+# the org's reusable `push-package-workflow`. This is in addition to the
+# team-scoped `ado-publish.yml` (which publishes `ai4s-jobq` to the
+# molecular-dynamics feed).
+#
+# The shared feed enforces the internal naming policy: every distribution must
+# be named with the `msresearch-` prefix (or hold an approved exception). To
+# satisfy that without changing the public-PyPI / molecular-dynamics
+# distribution name, the build job below rebuilds the distribution under the
+# name `msresearch-ai4s-jobq`. The import package (`ai4s.jobq`) is unchanged.
+#
+# Authentication is OIDC-federated (no stored secrets): the reusable workflow
+# mints a short-lived Azure DevOps token from the org-level onboarding secrets
+# (`PUSH_PACKAGE_CLIENT_ID` / `PUSH_PACKAGE_TENANT_ID`), passed through via
+# `secrets: inherit`.
+#
+# Prerequisites (org onboarding — owned by the push-package-workflow
+# maintainers, not this repo):
+#   1. Org-level secrets `PUSH_PACKAGE_CLIENT_ID` and `PUSH_PACKAGE_TENANT_ID`
+#      available to this repository.
+#   2. A federated credential on the publishing identity that trusts this
+#      repository (`msr-central/ai4s-jobq`) for the tag-triggered runs below.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build msresearch-ai4s-jobq distribution 📦
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+        fetch-depth: 0  # full history + tags so setuptools_scm derives the version
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: "3.x"
+    - name: Rename distribution for the MSR shared feed
+      # The shared feed requires the `msresearch-` prefix. Rewrite only the
+      # distribution name; the import package and console script are unchanged.
+      run: |
+        set -euo pipefail
+        sed -i 's/^name = "ai4s-jobq"$/name = "msresearch-ai4s-jobq"/' pyproject.toml
+        grep -q '^name = "msresearch-ai4s-jobq"$' pyproject.toml \
+          || { echo "ERROR: distribution rename failed"; exit 1; }
+    - name: Install pypa/build
+      run: python3 -m pip install build --user
+    - name: Install package and doc dependencies for skill build
+      run: pip install -e .[dev]
+    - name: Build Copilot skill data
+      run: python scripts/build_skill.py
+    - name: Build a binary wheel and a source tarball
+      run: python3 -m build
+    - name: Store the distribution packages
+      id: upload
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: msr-feed-distributions
+        path: dist/
+
+  publish-to-msr:
+    name: Publish 📦 to MSR shared feed
+    # Only publish on tag pushes; manual runs build without publishing.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+    - build
+    permissions:
+      id-token: write  # required for OIDC federation
+      contents: read
+      actions: read
+    # Pinned to a commit SHA (tracks push-package-workflow@main); Dependabot
+    # (github-actions ecosystem) keeps it current.
+    uses: msr-central/push-package-workflow/.github/workflows/push-package-ado.yml@a16d9df1e0cecc05459e71242f92ab6a1d82d4cf # main
+    with:
+      artifact_url: ${{ needs.build.outputs.artifact-url }}
+    secrets: inherit
