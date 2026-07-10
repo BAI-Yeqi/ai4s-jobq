@@ -1,0 +1,107 @@
+name: Publish to Azure DevOps Artifacts feed
+
+# Builds the package and publishes it to the internal Azure DevOps Artifacts
+# PyPI feed. Authentication uses GitHub OIDC federated identity (no stored
+# secrets): the job requests a GitHub Actions ID token, exchanges it for an
+# Azure AD token via `azure/login`, and uses that to obtain an Azure DevOps
+# access token for `twine upload`.
+#
+# Prerequisites (one-time setup):
+#   1. A GitHub environment named `ado-feed` on this repository, holding these
+#      secrets (so no internal identifiers are committed to the repo):
+#        - AZURE_CLIENT_ID       client (app) ID of the publishing identity
+#        - AZURE_TENANT_ID       Azure AD tenant ID
+#        - FEED_UPLOAD_URL       the feed's PyPI upload URL
+#        - ADO_PUBLISH_USERNAME  twine username (the publish identity name)
+#   2. A federated credential on the publishing identity's app registration
+#      with subject `repo:msr-central/ai4s-jobq:environment:ado-feed`,
+#      issuer `https://token.actions.githubusercontent.com`,
+#      audience `api://AzureADTokenExchange`.
+#   3. The publishing identity must be a Contributor on the target feed.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Azure DevOps resource ID — a global constant (identical for every Azure
+  # tenant, publicly documented), used to mint the feed access token. Not an
+  # internal identifier, so it is safe to keep in the workflow.
+  ADO_RESOURCE_ID: 499b84ac-1321-427f-aa17-267ca6975798
+
+
+jobs:
+  build:
+    name: Build distribution 📦
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+        fetch-depth: 0  # full history + tags so setuptools_scm derives the version
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: "3.x"
+    - name: Install pypa/build
+      run: python3 -m pip install build --user
+    - name: Install package and doc dependencies for skill build
+      run: pip install -e .[dev]
+    - name: Build Copilot skill data
+      run: python scripts/build_skill.py
+    - name: Build a binary wheel and a source tarball
+      run: python3 -m build
+    - name: Store the distribution packages
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: python-package-distributions
+        path: dist/
+
+  publish-to-ado:
+    name: Publish 📦 to Azure DevOps feed
+    # Only publish on tag pushes; manual runs build without publishing.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+    - build
+    runs-on: ubuntu-latest
+    environment: ado-feed
+    permissions:
+      id-token: write  # required for OIDC federated login
+      contents: read
+    steps:
+    - name: Download all the dists
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: python-package-distributions
+        path: dist/
+    - name: Azure login (OIDC)
+      uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        allow-no-subscriptions: true
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: "3.x"
+    - name: Install twine
+      run: python3 -m pip install twine --user
+    - name: Publish to Azure DevOps Artifacts feed
+      env:
+        TWINE_USERNAME: ${{ secrets.ADO_PUBLISH_USERNAME }}
+        FEED_UPLOAD_URL: ${{ secrets.FEED_UPLOAD_URL }}
+      run: |
+        TWINE_PASSWORD="$(az account get-access-token \
+          --resource "$ADO_RESOURCE_ID" \
+          --query accessToken --output tsv)"
+        export TWINE_PASSWORD
+        python3 -m twine upload \
+          --repository-url "$FEED_UPLOAD_URL" \
+          --skip-existing \
+          --non-interactive \
+          --verbose \
+          dist/*
