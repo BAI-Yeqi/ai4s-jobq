@@ -1,6 +1,17 @@
 CHANGELOG
 =========
 
+3.14.1 (2026-07-10)
+-------------------
+
+Fixes:
+
+* **Track dashboard: render graph in local workflow-file preview mode.**
+  When running ``ai4s-jobq track --workflow-file ...``, the graph view could
+  stay empty until a workflow was manually selected. The graph callback now
+  auto-selects an available workflow (preferring pending) when no selection is
+  present, so DAG visualisation appears on initial load.
+
 3.14.0 (2026-07-07)
 -------------------
 
