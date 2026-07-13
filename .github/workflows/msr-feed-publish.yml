@@ -79,9 +79,12 @@ jobs:
       id-token: write  # required for OIDC federation
       contents: read
       actions: read
-    # Pinned to a commit SHA (tracks push-package-workflow@main); Dependabot
-    # (github-actions ecosystem) keeps it current.
-    uses: msr-central/push-package-workflow/.github/workflows/push-package-ado.yml@a16d9df1e0cecc05459e71242f92ab6a1d82d4cf # main
+    # Referenced as @main (not a pinned SHA) on purpose: the reusable-workflow
+    # ref flows into the OIDC token's subject claim, and the publishing
+    # identity's federated credential is scoped to @main — a SHA ref would not
+    # match and no token would be issued. The push-package-workflow maintainers
+    # pin the actions/packages inside that workflow to specific SHAs instead.
+    uses: msr-central/push-package-workflow/.github/workflows/push-package-ado.yml@main
     with:
       artifact_url: ${{ needs.build.outputs.artifact-url }}
     secrets: inherit
