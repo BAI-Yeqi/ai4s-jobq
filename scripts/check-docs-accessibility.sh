@@ -21,6 +21,17 @@ rm -fr dist-doc ; sphinx-build -b html ./docs dist-doc
 python -m http.server $PORT --directory dist-doc >/dev/null 2>&1 &
 SERVER_PID=$!
 
-./node_modules/.bin/pa11y-ci -s "$SERVER/sitemap.xml"
+# Ensure the server is stopped on any exit path.
+trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
-kill $SERVER_PID || true
+# Wait for the server to start accepting connections before running pa11y,
+# otherwise the sitemap fetch races the server startup and fails
+# intermittently with "The sitemap ... could not be loaded".
+for _ in $(seq 1 30); do
+    if curl -sf "$SERVER/sitemap.xml" -o /dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+./node_modules/.bin/pa11y-ci -s "$SERVER/sitemap.xml"
