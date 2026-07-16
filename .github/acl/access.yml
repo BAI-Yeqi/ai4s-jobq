@@ -8,5 +8,5 @@ configuration:
   manageAccess:
   - team: ai4s-eng-all
     role: Maintain
-  - user: timhempel_microsoft
+  - member: timhempel_microsoft
     role: Write
