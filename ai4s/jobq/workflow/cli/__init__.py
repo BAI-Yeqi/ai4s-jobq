@@ -17,10 +17,12 @@ import asyncclick as click
 from ai4s.jobq.workflow.cli._shared import (
     _STATUS_STYLE,
     _build_task_table,
+    _config_banner,
     _format_target,
     _get_client,
     _print_target_banner,
     _print_task_table,
+    _resolve_env,
     _status_to_dict,
     _styled_status,
     _table_names,
@@ -265,22 +267,23 @@ def workflow_validate(definition_files: tuple[str, ...]) -> None:
     "-v", "--verbose", is_flag=True, help="Show full error messages instead of truncating."
 )
 @click.option(
-    "--by-layer",
-    is_flag=True,
+    "--by-layer/--no-by-layer",
+    default=False,
     help=(
         "Show a per-layer rollup of task counts (pending, running, "
         "completed, failed) above the per-task table. A layer is the "
         "task name with its trailing numeric index stripped, so e.g. "
         "tasks ``sim-1-0000001`` and ``sim-1-0000002`` share layer "
-        "``sim-1``."
+        "``sim-1``. Off by default for status."
     ),
 )
 @click.option(
-    "--no-tasks",
-    is_flag=True,
+    "--tasks/--no-tasks",
+    "show_tasks",
+    default=True,
     help=(
-        "Suppress the per-task table. Useful for large workflows where "
-        "the table itself dominates output; combine with --by-layer for "
+        "Show the per-task table. Pass --no-tasks for large workflows "
+        "where the table dominates output; combine with --by-layer for "
         "a compact rollup."
     ),
 )
@@ -291,7 +294,7 @@ async def workflow_status(
     as_json: bool,
     verbose: bool,
     by_layer: bool,
-    no_tasks: bool,
+    show_tasks: bool,
 ) -> None:
     """Show the status of a workflow."""
     async with await _get_client(ctx) as client:
@@ -304,7 +307,7 @@ async def workflow_status(
     from rich.console import Console
 
     Console().print(
-        _render_status(status, verbose=verbose, by_layer=by_layer, show_tasks=not no_tasks)
+        _render_status(status, verbose=verbose, by_layer=by_layer, show_tasks=show_tasks)
     )
 
 
@@ -649,7 +652,7 @@ async def workflow_list(
 
 
 @workflow_group.command("tasks")
-@click.option("--workflow", "workflow_id", default=None, help="Filter by workflow ID.")
+@click.argument("workflow_ids", metavar="[WORKFLOW_ID ...]", nargs=-1)
 @click.option(
     "--status",
     "filter_status",
@@ -672,7 +675,7 @@ async def workflow_list(
 @click.pass_context
 async def workflow_tasks(
     ctx: click.Context,
-    workflow_id: str | None,
+    workflow_ids: tuple[str, ...],
     filter_status: str | None,
     queue: str | None,
     name_prefix: str | None,
@@ -682,16 +685,35 @@ async def workflow_tasks(
 ) -> None:
     """List tasks, optionally filtered by workflow, status, queue, or name prefix.
 
-    Without ``--workflow``, this scans every workflow in the store, which
-    can be slow on large deployments. Prefer ``--workflow <id>`` whenever
-    you can.
+    Pass one or more WORKFLOW_IDs to scope to those workflows (for
+    example, ``tasks wf-a wf-b``). Without any, this scans every workflow
+    in the store, which can be slow on large deployments — prefer scoping
+    to specific workflows whenever you can.
     """
     max_tasks = limit if limit > 0 else None
 
     async with await _get_client(ctx) as client:
-        if workflow_id:
+        if len(workflow_ids) == 1:
             await _list_tasks_single(
-                client, workflow_id, filter_status, queue, name_prefix, max_tasks, as_json, verbose
+                client,
+                workflow_ids[0],
+                filter_status,
+                queue,
+                name_prefix,
+                max_tasks,
+                as_json,
+                verbose,
+            )
+        elif workflow_ids:
+            await _list_tasks_multi(
+                client,
+                list(workflow_ids),
+                filter_status,
+                queue,
+                name_prefix,
+                max_tasks,
+                as_json,
+                verbose,
             )
         else:
             printed = await _list_tasks_global(
@@ -723,6 +745,50 @@ async def _list_tasks_single(
         click.echo("No tasks found.")
     else:
         _print_task_table(tasks, verbose=verbose)
+
+
+async def _list_tasks_multi(
+    client: WorkflowClient,
+    workflow_ids: list[str],
+    filter_status: str | None,
+    queue: str | None,
+    name_prefix: str | None,
+    max_tasks: int | None,
+    as_json: bool,
+    verbose: bool,
+) -> None:
+    """List tasks for an explicit set of workflows.
+
+    JSON output is a single array with each entry tagged by
+    ``workflow_id``; text output prints one table per workflow.
+    """
+    collected: list = []
+    printed = 0
+
+    for wf_id in workflow_ids:
+        if max_tasks and printed >= max_tasks:
+            break
+        tasks = await client.list_tasks(
+            wf_id, status=filter_status, queue=queue, name_prefix=name_prefix
+        )
+        if as_json:
+            for t in tasks:
+                entry = _task_to_dict(t)
+                entry["workflow_id"] = wf_id
+                collected.append(entry)
+        else:
+            batch = tasks if not max_tasks else tasks[: max_tasks - printed]
+            if batch:
+                click.echo(f"\n{wf_id}:")
+                _print_task_table(batch, verbose=verbose)
+                printed += len(batch)
+
+    if as_json:
+        if max_tasks:
+            collected = collected[:max_tasks]
+        click.echo(json.dumps(collected, indent=2, default=str))
+    elif printed == 0:
+        click.echo("No tasks found.")
 
 
 async def _list_tasks_global(
@@ -770,11 +836,23 @@ async def _list_tasks_global(
 
 @workflow_group.command("cancel")
 @click.argument("workflow_id")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 @click.pass_context
-async def workflow_cancel(ctx: click.Context, workflow_id: str) -> None:
+async def workflow_cancel(ctx: click.Context, workflow_id: str, as_json: bool) -> None:
     """Cancel a running workflow."""
     async with await _get_client(ctx) as client:
         await client.cancel(workflow_id)
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "workflow_id": workflow_id,
+                    "cancelled": True,
+                    "target": _format_target(ctx),
+                }
+            )
+        )
+        return
     click.echo(f"Cancelled workflow {workflow_id} in {_format_target(ctx)}.")
 
 
@@ -823,23 +901,24 @@ async def workflow_retry(ctx: click.Context, workflow_id: str, as_json: bool) ->
     "--batch-size",
     type=int,
     default=None,
-    envvar="JOBQ_COMPLETION_BATCH_SIZE",
+    envvar="JOBQ_COORDINATOR_BATCH_SIZE",
     help=(
         "Max completions to pull from the completion queue per batch. "
         "Higher values increase throughput on busy workflows but raise "
-        "per-iteration latency. Default: 32. [env: JOBQ_COMPLETION_BATCH_SIZE]"
+        "per-iteration latency. Default: 32. [env: JOBQ_COORDINATOR_BATCH_SIZE, "
+        "config: coordinator.batch_size]"
     ),
 )
 @click.option(
     "--visibility-timeout-s",
     type=float,
     default=None,
-    envvar="JOBQ_COMPLETION_VISIBILITY_TIMEOUT_S",
+    envvar="JOBQ_COORDINATOR_VISIBILITY_TIMEOUT_S",
     help=(
         "Visibility timeout in seconds for completion messages. "
         "If the coordinator crashes mid-batch the messages reappear "
         "after this interval. Default: 60. "
-        "[env: JOBQ_COMPLETION_VISIBILITY_TIMEOUT_S]"
+        "[env: JOBQ_COORDINATOR_VISIBILITY_TIMEOUT_S, config: coordinator.visibility_timeout_s]"
     ),
 )
 @click.option(
@@ -977,7 +1056,7 @@ async def workflow_coordinator(
         DEFAULT_VISIBILITY_TIMEOUT_S,
         Coordinator,
     )
-    from ai4s.jobq.workflow.env import WorkflowEnv, WorkflowEnvError
+    from ai4s.jobq.workflow.env import WorkflowEnvError
 
     if not _stdlib_logging.getLogger().handlers:
         setup_logging(
@@ -988,17 +1067,12 @@ async def workflow_coordinator(
 
     storage = ctx.obj.get("storage")
     prefix = ctx.obj.get("prefix")
-    if not storage or not prefix:
-        raise click.UsageError(
-            "Workflow account and prefix not configured. Pass STORAGE/PREFIX "
-            "positionally (e.g. `ai4s-jobq workflow myaccount/MyProject coordinator`) "
-            "or set JOBQ_WORKFLOW_PREFIX=<account>/<prefix>."
-        )
 
     try:
-        env = WorkflowEnv.from_environ(state_account=storage, prefix=prefix)
+        env = _resolve_env(ctx)
     except WorkflowEnvError as exc:
         raise click.UsageError(str(exc)) from exc
+    storage, prefix = env.state_account, env.prefix
 
     if env.queues.startswith("sb://"):
         raise click.UsageError(
@@ -1007,35 +1081,39 @@ async def workflow_coordinator(
             "Azure Storage account."
         )
 
-    effective_batch_size = batch_size if batch_size is not None else DEFAULT_BATCH_SIZE
-    effective_visibility_timeout = (
-        visibility_timeout_s if visibility_timeout_s is not None else DEFAULT_VISIBILITY_TIMEOUT_S
-    )
-    effective_idle_sleep = idle_sleep_s if idle_sleep_s is not None else DEFAULT_IDLE_SLEEP_S
-    effective_cancel_poll = (
-        cancel_poll_interval_s
-        if cancel_poll_interval_s is not None
-        else DEFAULT_CANCEL_POLL_INTERVAL_S
-    )
-    effective_flush_retry = (
-        flush_retry_limit if flush_retry_limit is not None else DEFAULT_FLUSH_RETRY_LIMIT
-    )
-    effective_ready_sweep = (
-        ready_sweep_interval_s
-        if ready_sweep_interval_s is not None
-        else DEFAULT_READY_SWEEP_INTERVAL_S
-    )
-    effective_ready_threshold = (
-        ready_repair_threshold_s
-        if ready_repair_threshold_s is not None
-        else DEFAULT_READY_REPAIR_THRESHOLD_S
-    )
-    effective_running_sweep = (
-        running_sweep_interval_s
-        if running_sweep_interval_s is not None
-        else DEFAULT_RUNNING_SWEEP_INTERVAL_S
-    )
+    # Resolve tuning knobs with precedence flag/env → config file → default.
+    # Click already merged flag + JOBQ_COORDINATOR_* env (None when neither
+    # was set), so the config-file `coordinator` section fills the gap.
+    coord_cfg = env.coordinator
 
+    def pick(cli_val, key, default):
+        if cli_val is not None:
+            return cli_val
+        if key in coord_cfg:
+            return coord_cfg[key]
+        return default
+
+    effective_batch_size = pick(batch_size, "batch_size", DEFAULT_BATCH_SIZE)
+    effective_visibility_timeout = pick(
+        visibility_timeout_s, "visibility_timeout_s", DEFAULT_VISIBILITY_TIMEOUT_S
+    )
+    effective_idle_sleep = pick(idle_sleep_s, "idle_sleep_s", DEFAULT_IDLE_SLEEP_S)
+    effective_cancel_poll = pick(
+        cancel_poll_interval_s, "cancel_poll_interval_s", DEFAULT_CANCEL_POLL_INTERVAL_S
+    )
+    effective_flush_retry = pick(flush_retry_limit, "flush_retry_limit", DEFAULT_FLUSH_RETRY_LIMIT)
+    effective_ready_sweep = pick(
+        ready_sweep_interval_s, "ready_sweep_interval_s", DEFAULT_READY_SWEEP_INTERVAL_S
+    )
+    effective_ready_threshold = pick(
+        ready_repair_threshold_s, "ready_repair_threshold_s", DEFAULT_READY_REPAIR_THRESHOLD_S
+    )
+    effective_running_sweep = pick(
+        running_sweep_interval_s, "running_sweep_interval_s", DEFAULT_RUNNING_SWEEP_INTERVAL_S
+    )
+    effective_running_timeout = pick(running_timeout_s, "running_timeout_s", None)
+
+    click.echo(_config_banner(env, "Coordinator"), err=True)
     click.echo("Coordinator target:", err=True)
     click.echo(f"  State account:   {env.state_account} (prefix={env.prefix})", err=True)
     click.echo(f"  Queue backend:   {env.queues} (Storage Queue)", err=True)
@@ -1048,7 +1126,9 @@ async def workflow_coordinator(
         f"  Ready repair:    every {effective_ready_sweep}s (threshold {effective_ready_threshold}s)",
         err=True,
     )
-    running_timeout_str = f"{running_timeout_s}s" if running_timeout_s is not None else "disabled"
+    running_timeout_str = (
+        f"{effective_running_timeout}s" if effective_running_timeout is not None else "disabled"
+    )
     click.echo(
         f"  Running timeout: {running_timeout_str} (sweep every {effective_running_sweep}s)",
         err=True,
@@ -1069,6 +1149,7 @@ async def workflow_coordinator(
     async with await Coordinator.from_environment(
         state_account=storage,
         prefix=prefix,
+        config=ctx.obj.get("config"),
         batch_size=effective_batch_size,
         visibility_timeout_s=effective_visibility_timeout,
         idle_sleep_s=effective_idle_sleep,
@@ -1076,7 +1157,7 @@ async def workflow_coordinator(
         flush_retry_limit=effective_flush_retry,
         ready_sweep_interval_s=effective_ready_sweep,
         ready_repair_threshold_s=effective_ready_threshold,
-        running_timeout_s=running_timeout_s,
+        running_timeout_s=effective_running_timeout,
         running_sweep_interval_s=effective_running_sweep,
     ) as coord:
         try:
@@ -1262,6 +1343,7 @@ def _confirm_purge(
 )
 @click.option(
     "--yes",
+    "-y",
     is_flag=True,
     help="Skip confirmation prompt.",
 )
@@ -1288,8 +1370,6 @@ async def workflow_purge(
         TimeElapsedColumn,
     )
 
-    from ai4s.jobq.workflow.env import WorkflowEnv, WorkflowEnvError
-
     storage = ctx.obj.get("storage") or "<unset>"
     prefix = ctx.obj.get("prefix") or "<unset>"
     wf_table, task_table = _table_names(prefix)
@@ -1300,10 +1380,7 @@ async def workflow_purge(
     queues_account: str | None = None
     discovered_queues: list[str] = []
     if drain_queues:
-        try:
-            env = WorkflowEnv.from_environ(state_account=storage, prefix=prefix)
-        except WorkflowEnvError as exc:
-            raise click.UsageError(str(exc)) from exc
+        env = _resolve_env(ctx)
         queues_account = env.queues
         # Discover queue names so the user sees exactly what's about
         # to be drained before they confirm.
@@ -1378,7 +1455,7 @@ async def workflow_purge(
 
 
 @workflow_group.command("track")
-@click.option("port", "-p", default=8050, type=int, help="Port to run the dashboard on.")
+@click.option("--port", "-p", "port", default=8050, type=int, help="Port to run the dashboard on.")
 @click.option("--no-open", is_flag=True, help="Don't auto-open a browser window.")
 @click.option("--debug", is_flag=True, help="Enable debug logging.")
 @click.pass_context
@@ -1414,3 +1491,92 @@ async def workflow_track(ctx: click.Context, debug: bool, port: int, no_open: bo
     from ai4s.jobq.track.app import run_with_default_queue
 
     run_with_default_queue(debug=debug, port=port, open_browser=not no_open)
+
+
+_CONFIG_TEMPLATE = """\
+# ai4s-jobq workflow config. Shared by the coordinator, workers, and
+# clients so multiple terminals use one target without exporting env vars.
+# Precedence: CLI flag > env var > this file > built-in default.
+connection:
+  storage: {storage}          # storage account hosting workflow tables
+  prefix:  {prefix}           # namespaces tables: <prefix>Workflows, <prefix>WorkflowTasks
+  # queues: sb://my-namespace          # optional: Service Bus, or another account
+  # blobs:  {storage}/jobq-workflow-data  # optional: large-output blob storage
+
+# Optional coordinator tuning defaults (all overridable per-invocation):
+# coordinator:
+#   batch_size: 32
+#   visibility_timeout_s: 60
+#   running_timeout_s: 3600
+"""
+
+
+@workflow_group.group("config")
+def workflow_config() -> None:
+    """Inspect and scaffold the shared jobq.yaml config file."""
+
+
+@workflow_config.command("init")
+@click.option(
+    "--path",
+    "out_path",
+    default="jobq.yaml",
+    show_default=True,
+    type=click.Path(),
+    help="Where to write the config file.",
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing file.")
+@click.pass_context
+def workflow_config_init(ctx: click.Context, out_path: str, force: bool) -> None:
+    """Scaffold a commented jobq.yaml, pre-filled from any resolved target."""
+    import os
+
+    if os.path.exists(out_path) and not force:
+        raise click.UsageError(f"{out_path} already exists; pass --force to overwrite.")
+
+    storage = ctx.obj.get("storage") or "myaccount"
+    prefix = ctx.obj.get("prefix") or "MyProject"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(_CONFIG_TEMPLATE.format(storage=storage, prefix=prefix))
+    click.echo(f"Wrote {out_path}")
+
+
+@workflow_config.command("show")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+@click.pass_context
+def workflow_config_show(ctx: click.Context, as_json: bool) -> None:
+    """Show the resolved configuration and where each value came from."""
+    env = _resolve_env(ctx)
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "storage": env.state_account,
+                    "prefix": env.prefix,
+                    "queues": env.queues,
+                    "blobs": f"{env.blob_account}/{env.blob_container}",
+                    "sources": env.sources,
+                    "config_path": env.config_path,
+                    "coordinator": env.coordinator,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    rows = [
+        ("storage", env.state_account, env.sources.get("storage", "")),
+        ("prefix", env.prefix, env.sources.get("prefix", "")),
+        ("queues", env.queues, env.sources.get("queues", "")),
+        ("blobs", f"{env.blob_account}/{env.blob_container}", env.sources.get("blobs", "")),
+    ]
+    width = max(len(v) for _, v, _ in rows)
+    for key, value, source in rows:
+        tag = f"({source})" if source else ""
+        click.echo(f"  {key:<8} {value:<{width}}  {tag}")
+    click.echo(f"  {'config':<8} {env.config_path or '<none found>'}")
+    if env.coordinator:
+        click.echo("  coordinator (from config file):")
+        for key, value in env.coordinator.items():
+            click.echo(f"    {key} = {value}")

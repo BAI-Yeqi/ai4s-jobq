@@ -1,6 +1,49 @@
 CHANGELOG
 =========
 
+3.15.0 (2026-07-15)
+-------------------
+
+The ``ai4s-jobq workflow`` CLI got a consistency overhaul. **Breaking
+changes** to deployment scripts. Update them accordingly.
+
+Features:
+
+* **Shared ``jobq.yaml`` config file.** The coordinator, workers, and
+  submitting clients can now read connection and coordinator-tuning
+  defaults from a single ``jobq.yaml`` instead of each terminal exporting
+  the same environment variables. Discovery order: ``--config PATH`` →
+  ``JOBQ_WORKFLOW_CONFIG`` → ``./jobq.yaml`` → ``./.jobq.yaml`` →
+  ``~/.config/ai4s-jobq/jobq.yaml``. Precedence is CLI flag → env var →
+  config file → built-in default. Two helper commands manage it:
+  ``ai4s-jobq workflow config init`` (scaffold) and
+  ``ai4s-jobq workflow config show`` (merged values with per-value source,
+  ``--json`` supported).
+* **``--queues`` / ``--blobs`` group flags.** The queue backend and
+  large-output blob account are now settable as CLI flags on the
+  ``workflow`` group, not just via ``JOBQ_WORKFLOW_QUEUES`` /
+  ``JOBQ_WORKFLOW_BLOBS``.
+* **Startup config banner.** Every ``workflow`` command prints a compact
+  one-line banner to stderr summarising the resolved target and the source
+  (flag/env/file) of each value.
+
+Changes (breaking):
+
+* **Coordinator env vars unified under ``JOBQ_COORDINATOR_*``.**
+  ``JOBQ_COMPLETION_BATCH_SIZE`` → ``JOBQ_COORDINATOR_BATCH_SIZE`` and
+  ``JOBQ_COMPLETION_VISIBILITY_TIMEOUT_S`` →
+  ``JOBQ_COORDINATOR_VISIBILITY_TIMEOUT_S`` so all coordinator knobs share
+  one prefix.
+* **``workflow tasks`` takes workflow IDs positionally.**
+  ``workflow tasks --workflow WF`` is now ``workflow tasks WF`` and accepts
+  more than one (``workflow tasks WF1 WF2``); omit them for a global scan,
+  matching ``status``/``watch``/``cancel``/``retry``.
+* **Consistent option styles.** ``status`` and ``watch`` share the
+  ``--tasks/--no-tasks`` and ``--by-layer/--no-by-layer`` toggles; ``--yes/-y``
+  is accepted on all destructive commands (``purge`` gained ``-y``);
+  ``cancel`` gained ``--json``; ``track`` gained the ``--port`` long form
+  (both the workflow and core ``track`` commands).
+
 3.14.1 (2026-07-10)
 -------------------
 

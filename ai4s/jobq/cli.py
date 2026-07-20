@@ -806,7 +806,7 @@ def _set_subscription_id(
     envvar="JOBQ_LA_WORKSPACE",
     required=False,
 )
-@click.option("port", "-p", default=8050, type=int, help="Port to run the dashboard on.")
+@click.option("--port", "-p", default=8050, type=int, help="Port to run the dashboard on.")
 @click.option(
     "--subscription-id",
     help="Azure Subscription ID to use. This is only needed when obtaining the workspace ID from an instrumentation key.",

@@ -91,12 +91,13 @@ crashes:
 ### One coordinator per prefix
 
 Run **exactly one** coordinator process per `JOBQ_WORKFLOW_PREFIX` prefix.
-There is no lease, no leader election, and no quorum: the design
-assumes a single writer to each runtime blob. Two coordinators
-against the same prefix will fight over READY → RUNNING transitions
-and burn ETag retries on every step. For HA, deploy the coordinator
-behind a single-replica scheduler (Kubernetes Deployment with
-`replicas: 1` and `Recreate` strategy, systemd service, etc.) so a
+A blob-lease guards the coordinator so a second process waits for the
+lease rather than racing on the runtime blob, but there is no leader
+election or quorum: the design still assumes a single writer. A crashed
+coordinator's lease expires after about a minute; run `ai4s-jobq workflow break-lease`
+(or `coordinator --break-lease`) to clear it immediately. For HA, deploy
+the coordinator behind a single-replica scheduler (Kubernetes Deployment
+with `replicas: 1` and `Recreate` strategy, systemd service, etc.) so a
 new instance starts only after the previous one exits.
 
 ### How workers report completions
@@ -292,10 +293,13 @@ Query by prefix from the CLI:
 
 ```bash
 # All training tasks
-ai4s-jobq workflow tasks --workflow abc123 --prefix train-
+ai4s-jobq workflow tasks abc123 --prefix train-
 
 # Failed prep tasks
-ai4s-jobq workflow tasks --workflow abc123 --prefix prep- --status failed
+ai4s-jobq workflow tasks abc123 --prefix prep- --status failed
+
+# Several workflows at once
+ai4s-jobq workflow tasks abc123 def456 --status failed
 ```
 
 Programmatic inspection uses the same prefix filtering; see
@@ -711,8 +715,8 @@ the coordinator hard. Defaults are fine for everyday use.
 
 | Flag | Env var | Default | What it does |
 |------|---------|---------|--------------|
-| `--batch-size` | `JOBQ_COMPLETION_BATCH_SIZE` | 32 | Max completions pulled from the completion queue per receive. Higher values raise throughput on busy workflows but increase per-iteration latency. |
-| `--visibility-timeout-s` | `JOBQ_COMPLETION_VISIBILITY_TIMEOUT_S` | 60 | Visibility timeout in seconds for completion messages. If the coordinator crashes mid-batch the messages reappear after this interval. |
+| `--batch-size` | `JOBQ_COORDINATOR_BATCH_SIZE` | 32 | Max completions pulled from the completion queue per receive. Higher values raise throughput on busy workflows but increase per-iteration latency. |
+| `--visibility-timeout-s` | `JOBQ_COORDINATOR_VISIBILITY_TIMEOUT_S` | 60 | Visibility timeout in seconds for completion messages. If the coordinator crashes mid-batch the messages reappear after this interval. |
 | `--idle-sleep-s` | `JOBQ_COORDINATOR_IDLE_SLEEP_S` | 0.5 | Sleep between empty completion-queue polls. Lower for snappier wake-up at the cost of more idle polls. |
 | `--cancel-poll-interval-s` | `JOBQ_COORDINATOR_CANCEL_POLL_INTERVAL_S` | 1.0 | Interval between scans of the index for cancel-requested workflows. |
 | `--flush-retry-limit` | `JOBQ_COORDINATOR_FLUSH_RETRY_LIMIT` | 2 | Max retries on ETag conflict when flushing the runtime blob. Lower values bail to queue redelivery sooner under hot-spot contention. |
@@ -945,13 +949,55 @@ export JOBQ_WORKFLOW_BLOBS=blobs-account/container # Large outputs
 This isolates Table contention from queue polling and blob uploads,
 giving each subsystem its own throughput budget.
 
+## Config file (jobq.yaml)
+
+Instead of exporting the same environment variables in every terminal
+(coordinator, workers, submitting clients), you can commit a shared
+`jobq.yaml` to your project. Every `ai4s-jobq workflow` command discovers
+and merges it automatically.
+
+```yaml
+connection:
+  storage: mystorageacct        # storage account hosting workflow tables
+  prefix:  MyProject            # namespaces tables: <prefix>Workflows, ...
+  queues:  sb://my-namespace    # optional: Service Bus, or another account
+  blobs:   mystorageacct/wf-data  # optional: large-output blob storage
+coordinator:                    # optional coordinator tuning defaults
+  batch_size: 64
+  visibility_timeout_s: 60
+  running_timeout_s: 3600
+```
+
+**Precedence (highest → lowest):** CLI flag → environment variable →
+config file → built-in default. So the file is a shared baseline that any
+terminal can still override per-invocation (for example
+`ai4s-jobq workflow --queues sb://other coordinator --batch-size 128`).
+
+**Discovery order:** `--config PATH` → `JOBQ_WORKFLOW_CONFIG` →
+`./jobq.yaml` → `./.jobq.yaml` → `~/.config/ai4s-jobq/jobq.yaml`. A missing
+file is only an error when the path was given explicitly (via `--config` or
+`JOBQ_WORKFLOW_CONFIG`).
+
+Two helper commands manage the file:
+
+```bash
+ai4s-jobq workflow config init          # scaffold a commented jobq.yaml
+ai4s-jobq workflow config show          # show merged values + their sources
+ai4s-jobq workflow config show --json   # machine-readable, includes sources
+```
+
+`config show` prints where each value came from (`flag`/`env`/`file`/
+`default`). Every command also prints a compact one-line banner to stderr on
+startup summarising the resolved target and the source of each value.
+
 ## Environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `JOBQ_WORKFLOW_PREFIX` | Yes (workflow) | `<account>/<prefix>`—the state account plus the resource-name prefix (index Table `<prefix>WorkflowsIndex`, blob container `<prefix>-workflows`). Same account hosts queues and large-output blobs by default. |
-| `JOBQ_WORKFLOW_QUEUES` | No | Override the queue backend. Set to `sb://<namespace>` for Service Bus or to a different storage-account name to split state and queues. Defaults to the `JOBQ_WORKFLOW_PREFIX` account. |
-| `JOBQ_WORKFLOW_BLOBS` | For large outputs | `<account>/<container>` for stashing outputs over 32 KB. Defaults to the `JOBQ_WORKFLOW_PREFIX` account with container `<prefix>-outputs`. |
+| `JOBQ_WORKFLOW_PREFIX` | Yes (workflow) | `<account>/<prefix>`—the state account plus the resource-name prefix (index Table `<prefix>WorkflowsIndex`, blob container `<prefix>-workflows`). Same account hosts queues and large-output blobs by default. Also settable via the `STORAGE/PREFIX` positional or a `jobq.yaml` `connection:` section. |
+| `JOBQ_WORKFLOW_QUEUES` | No | Override the queue backend. Set to `sb://<namespace>` for Service Bus or to a different storage-account name to split state and queues. Defaults to the `JOBQ_WORKFLOW_PREFIX` account. Also settable via `--queues` or `jobq.yaml`. |
+| `JOBQ_WORKFLOW_BLOBS` | For large outputs | `<account>/<container>` for stashing outputs over 32 KB. Defaults to the `JOBQ_WORKFLOW_PREFIX` account with container `<prefix>-outputs`. Also settable via `--blobs` or `jobq.yaml`. |
+| `JOBQ_WORKFLOW_CONFIG` | No | Path to a shared `jobq.yaml` config file. Overrides discovery (`./jobq.yaml`, `./.jobq.yaml`, `~/.config/ai4s-jobq/jobq.yaml`). Also settable via `--config`. See [Config file](#config-file-jobqyaml). |
 | `JOBQ_WORKFLOW_ID` | Auto-set | Set by WorkflowShellCommandProcessor for subprocesses |
 | `JOBQ_WORKFLOW_TASK` | Auto-set | Set by WorkflowShellCommandProcessor for subprocesses |
 | `JOBQ_OUTPUT_FILE` | Auto-set | Temp file path for script output (written by `set_output()`) |
@@ -959,8 +1005,8 @@ giving each subsystem its own throughput budget.
 | `JOBQ_CANCEL_POLL_INTERVAL` | No | How often workers poll for cancellation (seconds, default 30) |
 | `JOBQ_MAX_IDLE_BACKOFF` | No | Upper bound on the worker's empty-queue exponential backoff (default 30 s). Set to a small value (for example, `2s`) when workers feed off a workflow coordinator that trickles tasks. Only meaningful with `--idle-timeout`. |
 | `JOBQ_HTTP_POOL_SIZE` | No | Size of the shared HTTP connection pool used by all Azure Storage clients (Tables, Queues, Blobs). Default is `100`. Bump it on coordinators or on workers running many parallel uploads if you see `pool full` warnings or stalled requests in the logs. |
-| `JOBQ_COMPLETION_BATCH_SIZE` | No | Equivalent to `workflow coordinator --batch-size`. Default 32. |
-| `JOBQ_COMPLETION_VISIBILITY_TIMEOUT_S` | No | Equivalent to `workflow coordinator --visibility-timeout-s`. Default 60. |
+| `JOBQ_COORDINATOR_BATCH_SIZE` | No | Equivalent to `workflow coordinator --batch-size`. Default 32. |
+| `JOBQ_COORDINATOR_VISIBILITY_TIMEOUT_S` | No | Equivalent to `workflow coordinator --visibility-timeout-s`. Default 60. |
 | `JOBQ_COORDINATOR_IDLE_SLEEP_S` | No | Equivalent to `workflow coordinator --idle-sleep-s`. Default 0.5. |
 | `JOBQ_COORDINATOR_CANCEL_POLL_INTERVAL_S` | No | Equivalent to `workflow coordinator --cancel-poll-interval-s`. Default 1.0. |
 | `JOBQ_COORDINATOR_FLUSH_RETRY_LIMIT` | No | Equivalent to `workflow coordinator --flush-retry-limit`. Default 2. |

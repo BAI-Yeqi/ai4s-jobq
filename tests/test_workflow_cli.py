@@ -106,7 +106,19 @@ async def _invoke_workflow(*args: str):
 
 
 def _context(storage: str | None = "acct", prefix: str | None = "pref") -> click.Context:
-    return click.Context(workflow_group, obj={"storage": storage, "prefix": prefix})
+    from ai4s.jobq.workflow.env import WorkflowEnv
+
+    obj: dict[str, object] = {
+        "storage": storage,
+        "prefix": prefix,
+        "config": None,
+        "queues_raw": None,
+        "blobs_raw": None,
+        "env": None,
+    }
+    if storage and prefix:
+        obj["env"] = WorkflowEnv.from_environ(state_account=storage, prefix=prefix)
+    return click.Context(workflow_group, obj=obj)
 
 
 def _make_task(
@@ -250,9 +262,70 @@ def test_shared_status_helpers_and_target_banner(capsys: pytest.CaptureFixture[s
 
     _print_target_banner(ctx, "Submit")
     captured = capsys.readouterr()
-    assert "Submit target: acct/pref" in captured.err, (
-        "'Submit target: acct/pref' should appear in stderr"
+    assert "Submit" in captured.err, "the banner should mention the action"
+    assert "acct" in captured.err, "the banner should mention the resolved account"
+    assert "pref" in captured.err, "the banner should mention the resolved prefix"
+
+
+def test_config_banner_tags_nondefault_sources() -> None:
+    """The compact banner tags flag/env/file sources but not defaults."""
+    from ai4s.jobq.workflow.cli._shared import _config_banner
+    from ai4s.jobq.workflow.env import WorkflowEnv
+
+    env = WorkflowEnv.from_environ(
+        state_account="acct",
+        prefix="pref",
+        queues="sb://ns",
     )
+    banner = _config_banner(env, "Submit")
+    assert banner.startswith("▶ Submit ")
+    assert "acct(flag)/pref(flag)" in banner
+    assert "queues=sb://ns(flag)" in banner
+    # blobs defaulted to the state account -> no source tag.
+    assert "blobs=acct/jobq-workflow-data" in banner
+    assert "blobs=acct/jobq-workflow-data(" not in banner
+
+
+async def test_config_show_reports_merged_sources(tmp_path, monkeypatch) -> None:
+    """`workflow config show --json` reports resolved values and their sources."""
+    from asyncclick.testing import CliRunner
+
+    for name in ("JOBQ_WORKFLOW_PREFIX", "JOBQ_WORKFLOW_QUEUES", "JOBQ_WORKFLOW_BLOBS"):
+        monkeypatch.delenv(name, raising=False)
+    cfg = tmp_path / "jobq.yaml"
+    cfg.write_text(
+        "connection:\n  storage: fileacct\n  prefix: FileProj\n",
+        encoding="utf-8",
+    )
+    result = await CliRunner(mix_stderr=False).invoke(
+        workflow_cli_group,
+        ["--config", str(cfg), "config", "show", "--json"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.output)
+    assert payload["storage"] == "fileacct"
+    assert payload["prefix"] == "FileProj"
+    assert payload["sources"]["storage"] == "file"
+    assert payload["sources"]["queues"] == "default"
+    assert payload["config_path"] == str(cfg)
+
+
+async def test_config_init_scaffolds_file(tmp_path, monkeypatch) -> None:
+    """`workflow config init` writes a jobq.yaml pre-filled from the target."""
+    from asyncclick.testing import CliRunner
+
+    out = tmp_path / "jobq.yaml"
+    result = await CliRunner(mix_stderr=False).invoke(
+        workflow_cli_group,
+        ["acct/Proj", "config", "init", "--path", str(out)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.stderr
+    assert out.is_file()
+    parsed = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert parsed["connection"]["storage"] == "acct"
+    assert parsed["connection"]["prefix"] == "Proj"
 
 
 def test_status_and_task_to_dict_include_optional_fields() -> None:
@@ -403,8 +476,8 @@ async def test_workflow_list_requires_configuration() -> None:
 
     assert result.exit_code == 2, "command should exit with a usage error"
     combined = (result.output or "") + (result.stderr or "")
-    assert "Workflow account and prefix not configured" in combined, (
-        "'Workflow account and prefix not configured' should appear in combined CLI output"
+    assert "Workflow storage account and prefix not configured" in combined, (
+        "'Workflow storage account and prefix not configured' should appear in combined CLI output"
     )
 
 
@@ -458,7 +531,7 @@ async def test_workflow_submit_single_status_and_tasks(
         'set(status["tasks"]) should match the expected values'
     )
 
-    tasks_result = await _invoke_workflow("tasks", "--workflow", "wf-cli-single", "--json")
+    tasks_result = await _invoke_workflow("tasks", "wf-cli-single", "--json")
     assert tasks_result.exit_code == 0, "command should exit successfully"
     tasks = json.loads(tasks_result.output)
     assert [task["name"] for task in tasks] == ["extract", "load", "transform"] or {
@@ -484,8 +557,9 @@ async def test_workflow_submit_batch_and_list_tasks_global(
     assert result.exit_code == 0, "command should exit successfully"
     workflow_ids = [line for line in result.output.splitlines() if line.strip()]
     assert len(workflow_ids) == 2, "workflow ids should contain 2 items"
-    assert f"Submit target: devstoreaccount1/{workflow_prefix}" in result.stderr, (
-        'f"Submit target: devstoreaccount1/{workflow prefix}" should appear in stderr'
+    assert "Submit" in result.stderr, "the banner should mention the action"
+    assert f"devstoreaccount1(env)/{workflow_prefix}" in result.stderr, (
+        "the compact config banner should show the resolved submit target"
     )
     assert "Submitted 2/2 workflows" in result.stderr, (
         "'Submitted 2/2 workflows' should appear in stderr"
@@ -799,7 +873,7 @@ async def test_workflow_tasks_text_and_limit_paths(monkeypatch: pytest.MonkeyPat
 
     _patch_cli_client(monkeypatch, FakeClient())
 
-    single_empty = await _invoke_workflow("tasks", "--workflow", "wf-empty")
+    single_empty = await _invoke_workflow("tasks", "wf-empty")
     limited = await _invoke_workflow("tasks", "--limit", "1")
     limited_json = await _invoke_workflow("tasks", "--json", "--limit", "1")
 
@@ -834,6 +908,47 @@ async def test_workflow_tasks_text_and_limit_paths(monkeypatch: pytest.MonkeyPat
     assert global_empty.output.strip() == "No tasks found.", (
         "command output should equal 'No tasks found.'"
     )
+
+
+async def test_workflow_tasks_multiple_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Passing several workflow IDs lists tasks for each and tags JSON output."""
+    monkeypatch.setenv("JOBQ_WORKFLOW_PREFIX", "acct/pref")
+    task_map = {
+        "wf-a": [_make_task("extract", status=TaskState.COMPLETED)],
+        "wf-b": [_make_task("train", status=TaskState.RUNNING)],
+    }
+
+    class FakeClient(_AsyncClientBase):
+        async def list_tasks(
+            self,
+            workflow_id: str,
+            *,
+            status: str | None = None,
+            queue: str | None = None,
+            name_prefix: str | None = None,
+        ) -> list[TaskStatus]:
+            return list(task_map[workflow_id])
+
+        async def list_workflows(self, *, status: str | None = None) -> list[WorkflowStatus]:
+            raise AssertionError("explicit IDs should not trigger a global scan")
+
+    _patch_cli_client(monkeypatch, FakeClient())
+
+    text_result = await _invoke_workflow("tasks", "wf-a", "wf-b")
+    json_result = await _invoke_workflow("tasks", "wf-a", "wf-b", "--json")
+
+    assert text_result.exit_code == 0, "command should exit successfully"
+    assert "wf-a:" in text_result.output, "the per-workflow header for wf-a should appear"
+    assert "wf-b:" in text_result.output, "the per-workflow header for wf-b should appear"
+    assert "extract" in text_result.output, "wf-a's task should appear"
+    assert "train" in text_result.output, "wf-b's task should appear"
+
+    assert json_result.exit_code == 0, "command should exit successfully"
+    payload = json.loads(json_result.output)
+    assert {entry["workflow_id"] for entry in payload} == {"wf-a", "wf-b"}, (
+        "each JSON entry should be tagged with its workflow_id"
+    )
+    assert len(payload) == 2, "both workflows' tasks should be present"
 
 
 async def test_workflow_retry_renders_reset_summary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1013,11 +1128,18 @@ async def test_workflow_coordinator_renders_banner_and_runs(
     def fake_setup_logging(name: str, *, internal_log_level: int, base_log_level: int) -> None:
         setup_calls.append((name, internal_log_level, base_log_level))
 
-    def fake_from_environ(cls, *, state_account: str | None = None, prefix: str | None = None):
+    def fake_from_environ(
+        cls, *, state_account=None, prefix=None, queues=None, blobs=None, config=None
+    ):
         return SimpleNamespace(
             queues="devstoreaccount1",
             state_account=state_account or "devstoreaccount1",
             prefix=prefix or "pref",
+            blob_account=state_account or "devstoreaccount1",
+            blob_container="jobq-workflow-data",
+            config_path=None,
+            coordinator={},
+            sources={"storage": "env", "prefix": "env", "queues": "default", "blobs": "default"},
         )
 
     class FakeCoordinator(_AsyncClientBase):
@@ -1064,6 +1186,8 @@ async def test_workflow_coordinator_renders_banner_and_runs(
     assert setup_calls == [("workflow-coordinator", logging.INFO, logging.WARNING)], (
         "logging should be initialized for the coordinator command"
     )
+    assert ran == [True], "coordinator run marker should match the expected values"
+    coordinator_kwargs.pop("config", None)
     assert coordinator_kwargs == {
         "state_account": "devstoreaccount1",
         "prefix": "pref",
@@ -1077,7 +1201,6 @@ async def test_workflow_coordinator_renders_banner_and_runs(
         "running_timeout_s": None,
         "running_sweep_interval_s": 60.0,
     }, "coordinator should receive the requested runtime options"
-    assert ran == [True], "coordinator run marker should match the expected values"
     assert "Coordinator target:" in result.stderr, "'Coordinator target:' should appear in stderr"
     assert "devstoreaccount1 (Storage Queue)" in result.stderr, (
         "queue backend description should appear in stderr"

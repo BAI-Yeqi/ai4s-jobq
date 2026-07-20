@@ -206,7 +206,7 @@ workflow, which is rare in practice.
 
 Two knobs help with throughput:
 
-- **`--batch-size` / `JOBQ_COMPLETION_BATCH_SIZE`** (default 32)
+- **`--batch-size` / `JOBQ_COORDINATOR_BATCH_SIZE`** (default 32)
   pulls more completions per receive, amortising queue RTT. Larger
   batches also increase the chance that sibling completions for the
   same workflow land in the same cycle, yielding one flush instead

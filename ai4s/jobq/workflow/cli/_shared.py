@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import asyncclick as click
@@ -34,37 +33,40 @@ def _styled_status(s: str) -> str:
     return f"[{style}]{s}[/{style}]" if style else s
 
 
-_WORKFLOW_SUBCOMMANDS = {
-    "submit",
-    "validate",
-    "status",
-    "watch",
-    "logs",
-    "list",
-    "tasks",
-    "cancel",
-    "retry",
-    "coordinator",
-    "break-lease",
-    "doctor",
-    "explain",
-    "summary",
-    "purge",
-    "track",
-}
-
-
 class WorkflowGroup(click.Group):
     """Workflow group that lets the leading positional ``STORAGE/PREFIX``
     arg be omitted when invoking a subcommand directly.
+
+    Because the group also accepts value-taking options (``--queues``,
+    ``--blobs``, ``--config``), the detection skips option values before
+    deciding whether the first positional token is a registered
+    subcommand (in which case ``STORAGE/PREFIX`` was omitted) rather than
+    relying on a hand-maintained subcommand list.
     """
 
     def parse_args(self, ctx, args):
+        args = list(args)
+        value_opts: set[str] = set()
+        for param in self.get_params(ctx):
+            if isinstance(param, click.Option) and not param.is_flag and not param.count:
+                value_opts.update(param.opts)
+                value_opts.update(param.secondary_opts)
+
         i = 0
-        while i < len(args) and args[i].startswith("-"):
-            i += 1
-        if i < len(args) and args[i] in _WORKFLOW_SUBCOMMANDS:
-            args = list(args)
+        while i < len(args):
+            tok = args[i]
+            if tok == "--":
+                i += 1
+                break
+            if tok.startswith("-"):
+                if "=" in tok or tok not in value_opts:
+                    i += 1
+                else:
+                    i += 2
+                continue
+            break
+
+        if i < len(args) and args[i] in self.commands:
             args.insert(i, "__none__")
         return super().parse_args(ctx, args)
 
@@ -88,50 +90,105 @@ def _parse_storage_prefix(value: str | None) -> tuple[str | None, str | None]:
     required=False,
     default=None,
 )
+@click.option(
+    "--queues",
+    default=None,
+    help="Queue backend for all workflow queues: a single account name or "
+    "'sb://<namespace>' for Service Bus (one backend, not a list of queues). "
+    "[env: JOBQ_WORKFLOW_QUEUES]",
+)
+@click.option(
+    "--blobs",
+    default=None,
+    help="Large-output blob storage override, as '<account>/<container>'. "
+    "[env: JOBQ_WORKFLOW_BLOBS]",
+)
+@click.option(
+    "--config",
+    "config_path",
+    default=None,
+    type=click.Path(),
+    help="Path to a jobq.yaml config file. Defaults to ./jobq.yaml, "
+    "./.jobq.yaml, or ~/.config/ai4s-jobq/jobq.yaml. [env: JOBQ_WORKFLOW_CONFIG]",
+)
 @click.pass_context
 def workflow_group(
     ctx: click.Context,
     storage_prefix: str | None,
+    queues: str | None,
+    blobs: str | None,
+    config_path: str | None,
 ) -> None:
     """Manage DAG-based workflows.
 
     \b
-    Storage and prefix can be provided two ways:
+    Storage and prefix can be provided three ways (highest precedence first):
       - Positional:  ai4s-jobq workflow myaccount/MyProject submit ...
       - Env var:     JOBQ_WORKFLOW_PREFIX=myaccount/MyProject
+      - Config file: a shared jobq.yaml (connection: storage/prefix)
 
-    Positional wins when both are supplied. The prefix is always
-    required so workflows from different projects on the same storage
-    account stay isolated.
+    Queues and blobs follow the same precedence via --queues/--blobs,
+    JOBQ_WORKFLOW_QUEUES/JOBQ_WORKFLOW_BLOBS, or the config file. Run
+    `ai4s-jobq workflow config show` to see the resolved values and where
+    each came from.
     """
     from ai4s.jobq.workflow.env import (
-        WORKFLOW_ENV,
         WorkflowEnv,
         WorkflowEnvError,
         _check_legacy_env,
+        load_config,
     )
 
     pos_storage, pos_prefix = _parse_storage_prefix(storage_prefix)
 
     try:
         _check_legacy_env()
+        cfg = load_config(config_path)
     except WorkflowEnvError as exc:
         raise click.UsageError(str(exc)) from exc
 
-    effective_storage = pos_storage
-    effective_prefix = pos_prefix
-
-    if (not effective_storage or not effective_prefix) and WORKFLOW_ENV in os.environ:
-        try:
-            env = WorkflowEnv.from_environ(state_account=effective_storage, prefix=effective_prefix)
-            effective_storage = env.state_account
-            effective_prefix = env.prefix
-        except WorkflowEnvError as exc:
-            raise click.UsageError(str(exc)) from exc
+    # Best-effort full resolution. A missing target is deferred to the
+    # command that actually needs one (e.g. `config init` needs nothing),
+    # so we swallow only the "not configured" case here.
+    env = None
+    try:
+        env = WorkflowEnv.from_environ(
+            state_account=pos_storage,
+            prefix=pos_prefix,
+            queues=queues,
+            blobs=blobs,
+            config=cfg,
+        )
+    except WorkflowEnvError:
+        env = None
 
     ctx.ensure_object(dict)
-    ctx.obj["storage"] = effective_storage
-    ctx.obj["prefix"] = effective_prefix
+    ctx.obj["config"] = cfg
+    ctx.obj["config_path"] = config_path
+    ctx.obj["queues_raw"] = queues
+    ctx.obj["blobs_raw"] = blobs
+    ctx.obj["env"] = env
+    ctx.obj["storage"] = env.state_account if env else pos_storage
+    ctx.obj["prefix"] = env.prefix if env else pos_prefix
+
+
+def _resolve_env(ctx: click.Context):
+    """Return the resolved :class:`WorkflowEnv` or raise a friendly error."""
+    from ai4s.jobq.workflow.env import WorkflowEnv, WorkflowEnvError
+
+    env = ctx.obj.get("env")
+    if env is not None:
+        return env
+    try:
+        return WorkflowEnv.from_environ(
+            state_account=ctx.obj.get("storage"),
+            prefix=ctx.obj.get("prefix"),
+            queues=ctx.obj.get("queues_raw"),
+            blobs=ctx.obj.get("blobs_raw"),
+            config=ctx.obj.get("config"),
+        )
+    except WorkflowEnvError as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 def _format_target(ctx: click.Context) -> str:
@@ -146,9 +203,46 @@ def _table_names(prefix: str) -> tuple[str, str]:
     return f"{prefix}Workflows", f"{prefix}WorkflowTasks"
 
 
+def _config_banner(env, action: str | None = None) -> str:
+    """Compact one-line summary of resolved config with per-value sources.
+
+    Values whose source is a non-default layer (flag/env/file) are tagged
+    with that source so it's obvious what won when config comes from
+    multiple places.
+    """
+    src = env.sources
+
+    def tag(key: str) -> str:
+        s = src.get(key, "")
+        return f"({s})" if s and s != "default" else ""
+
+    target = f"{env.state_account}{tag('storage')}/{env.prefix}{tag('prefix')}"
+    parts = [
+        target,
+        f"queues={env.queues}{tag('queues')}",
+        f"blobs={env.blob_account}/{env.blob_container}{tag('blobs')}",
+    ]
+    line = "  ".join(parts)
+    if env.config_path:
+        line += f"  [config: {env.config_path}]"
+    lead = f"{action} " if action else ""
+    return f"▶ {lead}{line}"
+
+
+def _print_config_banner(ctx: click.Context, action: str | None = None) -> None:
+    """Echo the compact resolved-config banner to stderr (once per run)."""
+    if ctx.obj.get("_banner_shown"):
+        return
+    env = ctx.obj.get("env")
+    if env is None:
+        return
+    click.echo(_config_banner(env, action), err=True)
+    ctx.obj["_banner_shown"] = True
+
+
 def _print_target_banner(ctx: click.Context, action: str) -> None:
-    """Echo a short ``Target: account/prefix`` line to stderr."""
-    click.echo(f"{action} target: {_format_target(ctx)}", err=True)
+    """Backwards-compatible entry point; renders the compact config banner."""
+    _print_config_banner(ctx, action)
 
 
 async def _get_client(ctx: click.Context) -> WorkflowClient:
@@ -159,21 +253,10 @@ async def _get_client(ctx: click.Context) -> WorkflowClient:
     overrides are honoured.
     """
     from ai4s.jobq.workflow.client import WorkflowClient as _WorkflowClient
-    from ai4s.jobq.workflow.env import WorkflowEnv, WorkflowEnvError
     from ai4s.jobq.workflow.persistence import WorkflowPersistence
 
-    storage = ctx.obj["storage"]
-    prefix = ctx.obj["prefix"]
-    if not storage or not prefix:
-        raise click.UsageError(
-            "Workflow account and prefix not configured. Pass STORAGE/PREFIX "
-            "positionally (e.g. `ai4s-jobq workflow myaccount/MyProject ...`) "
-            "or set JOBQ_WORKFLOW_PREFIX=<account>/<prefix>."
-        )
-    try:
-        env = WorkflowEnv.from_environ(state_account=storage, prefix=prefix)
-    except WorkflowEnvError as exc:
-        raise click.UsageError(str(exc)) from exc
+    env = _resolve_env(ctx)
+    _print_config_banner(ctx)
     persistence = await WorkflowPersistence.from_account(env.state_account, prefix=env.prefix)
     return _WorkflowClient(persistence, queues_account=env.queues, prefix=env.prefix)
 

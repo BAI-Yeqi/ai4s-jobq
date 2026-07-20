@@ -104,6 +104,7 @@ module = [
   "opencensus.ext.azure.*",
   "appdirs",
   "dash_bootstrap_components.*",
+  "dash_cytoscape.*",
   "yaml",
   "opentelemetry.*",
   "humanize",

@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import dash_bootstrap_components as dbc
-import dash_cytoscape as cyto  # type: ignore[import-not-found]
+import dash_cytoscape as cyto
 from dash import Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
 

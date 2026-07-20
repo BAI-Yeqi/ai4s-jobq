@@ -205,6 +205,8 @@ class Coordinator:
         *,
         state_account: str | None = None,
         prefix: str | None = None,
+        queues: str | None = None,
+        config: str | object | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
         visibility_timeout_s: float = DEFAULT_VISIBILITY_TIMEOUT_S,
         idle_sleep_s: float = DEFAULT_IDLE_SLEEP_S,
@@ -224,15 +226,21 @@ class Coordinator:
         backends here — the coordinator hot path requires Storage
         Queue's batched receive/visibility timeout semantics.
         """
-        from ai4s.jobq.workflow.env import WorkflowEnv
+        from ai4s.jobq.workflow.env import WorkflowConfig, WorkflowEnv
         from ai4s.jobq.workflow.ids import completion_queue_name
 
-        env = WorkflowEnv.from_environ(state_account=state_account, prefix=prefix)
+        env = WorkflowEnv.from_environ(
+            state_account=state_account,
+            prefix=prefix,
+            queues=queues,
+            config=config if isinstance(config, (str, WorkflowConfig)) else None,
+        )
         if env.queues.startswith("sb://"):
             raise ValueError(
                 "Coordinator requires a Storage Queue backend; "
                 f"got Service Bus ({env.queues}). Unset JOBQ_WORKFLOW_QUEUES "
-                "or point it at an Azure Storage account."
+                "(or the config-file queues override) or point it at an "
+                "Azure Storage account."
             )
         persistence = await WorkflowPersistence.from_account(env.state_account, prefix=env.prefix)
         return cls(

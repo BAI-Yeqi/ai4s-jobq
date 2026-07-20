@@ -167,12 +167,16 @@ prefix.
 - **Namespace package**: `ai4s/` uses `pkgutil.extend_path` — the `ai4s/__init__.py` must not contain regular imports.
 - **Environment-driven config**: `JOBQ_STORAGE`, `JOBQ_QUEUE`, `JOBQ_USE_MONTY_JSON`,
   `JOBQ_DETERMINISTIC_IDS` for core jobq; `JOBQ_WORKFLOW_PREFIX`, `JOBQ_WORKFLOW_QUEUES`,
-  `JOBQ_WORKFLOW_BLOBS`, `JOBQ_COMPLETION_BATCH_SIZE`,
+  `JOBQ_WORKFLOW_BLOBS`, `JOBQ_WORKFLOW_CONFIG` (shared `jobq.yaml`),
+  `JOBQ_COORDINATOR_BATCH_SIZE`, `JOBQ_COORDINATOR_VISIBILITY_TIMEOUT_S`,
   `JOBQ_COORDINATOR_READY_SWEEP_INTERVAL_S`,
   `JOBQ_COORDINATOR_READY_REPAIR_THRESHOLD_S` for workflow modules.
-- **Single coordinator per prefix**: There is no lease/leader election. Two coordinator
-  processes against the same `JOBQ_WORKFLOW_PREFIX` prefix will burn ETag retries on every
-  flush. Document and enforce single-replica deployment.
+- **Single coordinator per prefix**: A blob-lease guards the coordinator
+  (`_lease.py`), so a second coordinator against the same `JOBQ_WORKFLOW_PREFIX`
+  prefix waits for the lease rather than corrupting state. A crashed coordinator's
+  lease expires after ~60s; use `workflow break-lease` (or `coordinator --break-lease`)
+  to clear it immediately. Still deploy a single replica — the lease is a safety net,
+  not a scheduler.
 - **ETag-guarded blob writes**: `WorkflowPersistence` flushes the runtime-state blob via
   `_retry_with_etag`; coordinator and ready-repair sweep use it for every state change.
   Retry budget bounded by `--flush-retry-limit` (default 2).
