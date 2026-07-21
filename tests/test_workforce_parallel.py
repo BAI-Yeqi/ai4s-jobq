@@ -12,6 +12,7 @@ read.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +24,9 @@ import pytest
 pytest.importorskip("azure.ai.ml")
 
 from ai4s.jobq.orchestration.workforce import AmlExperiment, AmlJob, Workforce
+
+_TAG_URI = "registry.azurecr.io/repo:tag"
+_DIGEST_URI = "registry.azurecr.io/repo@sha256:" + "a" * 64
 
 
 def _make_job(name: str, status: str = "Paused") -> AmlJob:
@@ -59,11 +63,26 @@ def _bare_workforce(**overrides) -> Workforce:
     wf._aml_client.resource_group_name = "rg"
     wf._aml_client.workspace_name = "ws"
     wf._image_resolver = None
+    wf._image_assessment_gate = None
     wf._env_register_lock = threading.Lock()
     wf._registered_env_id_cache = {}
     for k, v in overrides.items():
         setattr(wf, k, v)
     return wf
+
+
+def _gated_workforce(monkeypatch, *, image=_TAG_URI, resolved=_DIGEST_URI):
+    resolver = MagicMock() if resolved is not None else None
+    if resolver is not None:
+        resolver.resolve.return_value = resolved
+    gate = MagicMock()
+    gate.assess.return_value = MagicMock(scanner_version="1.1.0")
+    wf = _bare_workforce(_image_resolver=resolver, _image_assessment_gate=gate)
+    environment = SimpleNamespace(image=image) if image is not None else "registered:1"
+    wf._job = SimpleNamespace(environment=environment, environment_variables={}, properties=None)
+    wf._ensure_env_registered = MagicMock(return_value="registered-environment")
+    monkeypatch.delenv("APPLICATIONINSIGHTS_CONNECTION_STRING", raising=False)
+    return wf, gate
 
 
 class TestBuildWorker:
@@ -94,6 +113,65 @@ class TestBuildWorker:
 
         j = wf._build_worker()
         assert j.environment_variables["APPLICATIONINSIGHTS_CONNECTION_STRING"] == "conn"
+
+    @pytest.mark.parametrize(("image", "resolved"), [(_TAG_URI, _DIGEST_URI), (_DIGEST_URI, None)])
+    def test_clean_gate_registers_stamps_and_submits(self, image, resolved, monkeypatch) -> None:
+        wf, gate = _gated_workforce(monkeypatch, image=image, resolved=resolved)
+        wf._job.properties = {"existing": "value"}
+
+        wf.hire(1, progress=False)
+
+        job = wf._aml_client.jobs.create_or_update.call_args.args[0]
+        gate.assess.assert_called_once_with(_DIGEST_URI)
+        assert wf._ensure_env_registered.call_args.args[0] is not wf._job.environment
+        assert wf._ensure_env_registered.call_args.args[0].image == _DIGEST_URI
+        assert job.environment == "registered-environment"
+        assert job.properties == {"existing": "value", "fedramp.scan-version": "1.1.0"}
+        assert wf._job.properties == {"existing": "value"}
+
+    def test_rejection_prevents_environment_registration_and_submission(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wf, gate = _gated_workforce(monkeypatch)
+        gate.assess.side_effect = RuntimeError("not clean")
+
+        with pytest.raises(RuntimeError, match="not clean"):
+            wf.hire(1, progress=False)
+
+        wf._ensure_env_registered.assert_not_called()
+        wf._aml_client.jobs.create_or_update.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("image", "resolved", "message"),
+        [
+            (None, None, r"environment\.image"),
+            (_TAG_URI, None, "digest-pinned"),
+            ("registry.azurecr.io/repo@sha256:abc", None, "digest-pinned"),
+            (_TAG_URI, _TAG_URI, "digest-pinned"),
+        ],
+    )
+    def test_gate_requires_digest_pinned_inline_image(
+        self, image, resolved, message, monkeypatch
+    ) -> None:
+        wf, gate = _gated_workforce(monkeypatch, image=image, resolved=resolved)
+
+        with pytest.raises(ValueError, match=message):
+            wf._build_worker()
+
+        gate.assess.assert_not_called()
+        wf._ensure_env_registered.assert_not_called()
+
+    def test_environment_registration_failure_prevents_stamp_and_submission(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wf, _ = _gated_workforce(monkeypatch)
+        wf._ensure_env_registered = MagicMock(side_effect=RuntimeError("registration failed"))
+
+        with pytest.raises(RuntimeError, match="registration failed"):
+            wf.hire(1, progress=False)
+
+        assert wf._job.properties is None
+        wf._aml_client.jobs.create_or_update.assert_not_called()
 
 
 class TestParallelHire:

@@ -46,6 +46,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from ai4s.jobq.orchestration.image_assessment import ImageAssessmentGate
     from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
 
 import jwt
@@ -243,6 +244,7 @@ class Workforce:
         servicebus_namespace: str | None = None,
         servicebus_topic: str | None = None,
         image_resolver: "ImageDigestResolver | None" = None,
+        image_assessment_gate: "ImageAssessmentGate | None" = None,
     ):
         self._job = worker_prototype
         self._experiment_name = experiment_name
@@ -259,6 +261,7 @@ class Workforce:
         self.cluster_type: str | None = None
         self.session = requests.Session()
         self._image_resolver = image_resolver
+        self._image_assessment_gate = image_assessment_gate
         self._env_register_lock = threading.Lock()
         self._registered_env_id_cache: dict[str, str] = {}
         t = self._credential.get_token("https://management.azure.com/.default")
@@ -273,6 +276,10 @@ class Workforce:
         all child workforces from a single point of configuration.
         """
         self._image_resolver = resolver
+
+    def set_image_assessment_gate(self, gate: "ImageAssessmentGate | None") -> None:
+        """Install (or clear) a submission gate after construction."""
+        self._image_assessment_gate = gate
 
     def _create_servicebus_resources(self):
         """
@@ -628,9 +635,9 @@ class Workforce:
         but shallow copy plus a fresh ``environment_variables`` dict is
         enough — no other attribute is mutated per-worker.
 
-        If an ``image_resolver`` is configured, the prototype's
-        ``environment.image`` is rewritten to a ``@sha256:...`` digest so
-        all workers within the TTL window pull identical bytes.
+        If configured, the image resolver pins ``environment.image`` to a
+        digest before the assessment gate checks it. Only a clean verdict is
+        stamped and allowed to proceed to environment registration.
         """
         job = copy.copy(self._job)
         # Give the copy its own env dict so parallel workers don't race on setdefault.
@@ -642,15 +649,36 @@ class Workforce:
         random_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         job.name = f"{self._experiment_name}-{random_id}"
 
-        if self._image_resolver is not None:
-            env = job.environment
-            original_image = getattr(env, "image", None)
-            if original_image:
-                resolved = self._image_resolver.resolve(original_image)
-                if resolved != original_image:
-                    new_env = copy.copy(env)
-                    new_env.image = resolved
-                    job.environment = self._ensure_env_registered(new_env)
+        env = job.environment
+        assessment_image = getattr(env, "image", None)
+        resolved_env = None
+        scanner_version = None
+        if assessment_image and self._image_resolver is not None:
+            resolved = self._image_resolver.resolve(assessment_image)
+            if resolved != assessment_image:
+                resolved_env = copy.copy(env)
+                resolved_env.image = resolved
+            assessment_image = resolved
+
+        if self._image_assessment_gate is not None:
+            if not assessment_image:
+                raise ValueError(
+                    "Image assessment requires worker_prototype.environment.image to be an URI"
+                )
+            if re.search(r"@sha256:[0-9a-f]{64}$", assessment_image) is None:
+                raise ValueError(
+                    "Image assessment requires an immutable digest-pinned worker image"
+                )
+            verdict = self._image_assessment_gate.assess(assessment_image)
+            resolved_env = copy.copy(env) if resolved_env is None else resolved_env
+            resolved_env.image = assessment_image
+            scanner_version = verdict.scanner_version
+
+        if resolved_env is not None:
+            job.environment = self._ensure_env_registered(resolved_env)
+        if scanner_version is not None:
+            job.properties = dict(job.properties or {})
+            job.properties["fedramp.scan-version"] = scanner_version
 
         return job
 

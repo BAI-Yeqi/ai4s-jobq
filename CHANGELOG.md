@@ -1,6 +1,12 @@
 CHANGELOG
 =========
 
+Unreleased
+----------
+
+* Add an optional strict artifact-only worker-image gate. Only clean assessments
+  reach AzureML submission and receive the ``fedramp.scan-version`` property.
+
 3.15.0 (2026-07-15)
 -------------------
 

@@ -60,6 +60,20 @@ def _make_mrw(
     return mrw
 
 
+def test_constructor_shares_image_assessment_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    workforces = [MagicMock(spec=Workforce), MagicMock(spec=Workforce)]
+    gate = MagicMock()
+    monkeypatch.setattr(
+        "ai4s.jobq.orchestration.multiregion_workforce.get_token_credential", MagicMock()
+    )
+
+    multi = MultiRegionWorkforce("queue", "storage", workforces, image_assessment_gate=gate)
+
+    assert multi.image_assessment_gate is gate
+    for workforce in workforces:
+        workforce.set_image_assessment_gate.assert_called_once_with(gate)
+
+
 # --- _region_parallelism ----------------------------------------------------
 
 
