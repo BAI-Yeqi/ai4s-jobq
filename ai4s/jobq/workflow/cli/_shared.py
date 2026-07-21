@@ -18,6 +18,7 @@ LOG = logging.getLogger("ai4s.jobq")
 _STATUS_STYLE: dict[str, str] = {
     "completed": "green",
     "running": "cyan",
+    "cancelling": "bold yellow",
     "failed": "red bold",
     "upstream_failed": "red",
     "pending": "dim",

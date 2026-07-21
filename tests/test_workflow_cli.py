@@ -993,6 +993,100 @@ async def test_workflow_retry_handles_empty_reset(monkeypatch: pytest.MonkeyPatc
     )
 
 
+async def test_workflow_cancel_text_says_cancellation_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel command must say 'Cancellation requested', not 'Cancelled'."""
+    monkeypatch.setenv("JOBQ_WORKFLOW_PREFIX", "acct/pref")
+
+    class FakeClient(_AsyncClientBase):
+        async def cancel(self, workflow_id: str) -> None:
+            assert workflow_id == "wf-cancel"
+
+    _patch_cli_client(monkeypatch, FakeClient())
+
+    result = await _invoke_workflow("cancel", "wf-cancel")
+
+    assert result.exit_code == 0, "command should exit successfully"
+    assert "Cancellation requested" in result.output, (
+        "cancel output should say 'Cancellation requested', not 'Cancelled'"
+    )
+    assert "Cancelled workflow" not in result.output, (
+        "cancel output must not imply the workflow is already terminal"
+    )
+
+
+async def test_workflow_cancel_json_uses_cancel_requested_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel --json output must use 'cancel_requested' key, not 'cancelled'."""
+    monkeypatch.setenv("JOBQ_WORKFLOW_PREFIX", "acct/pref")
+
+    class FakeClient(_AsyncClientBase):
+        async def cancel(self, workflow_id: str) -> None:
+            pass
+
+    _patch_cli_client(monkeypatch, FakeClient())
+
+    result = await _invoke_workflow("cancel", "--json", "wf-cancel-json")
+
+    assert result.exit_code == 0, "command should exit successfully"
+    data = json.loads(result.output)
+    assert data.get("cancel_requested") is True, "JSON output must contain 'cancel_requested: true'"
+    assert "cancelled" not in data, "JSON output must not contain the misleading 'cancelled' key"
+    assert data.get("workflow_id") == "wf-cancel-json"
+
+
+async def test_workflow_list_shows_cancelling_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workflow list must display 'cancelling' for workflows awaiting worker shutdown."""
+    monkeypatch.setenv("JOBQ_WORKFLOW_PREFIX", "acct/pref")
+
+    class FakeClient(_AsyncClientBase):
+        async def list_workflows(self, status: str | None = None) -> list[WorkflowStatus]:
+            return [
+                _make_workflow_status(
+                    "wf-cancelling",
+                    name="cancelling-wf",
+                    status=WorkflowState.CANCELLING,
+                    total=3,
+                    running=1,
+                    completed=0,
+                    failed=0,
+                    pending=0,
+                )
+            ]
+
+    _patch_cli_client(monkeypatch, FakeClient())
+
+    result = await _invoke_workflow("list")
+
+    assert result.exit_code == 0, "command should exit successfully"
+    assert "cancelling" in result.output, (
+        "'cancelling' should appear in list output for a workflow with CANCELLING status"
+    )
+
+
+async def test_workflow_list_styled_status_cancelling() -> None:
+    """cancelling status must be styled differently from running and cancelled."""
+    from ai4s.jobq.workflow.cli._shared import _styled_status
+
+    styled_running = _styled_status("running")
+    styled_cancelled = _styled_status("cancelled")
+    styled_cancelling = _styled_status("cancelling")
+
+    assert styled_cancelling != styled_running, (
+        "'cancelling' should have a different style from 'running'"
+    )
+    assert styled_cancelling != styled_cancelled, (
+        "'cancelling' should have a different style from 'cancelled'"
+    )
+    assert "cancelling" in styled_cancelling, (
+        "the status value 'cancelling' must appear in the styled output"
+    )
+
+
 async def test_workflow_summary_renders_text_output(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify that the summary command renders workflow and task aggregates in text mode."""
     monkeypatch.setenv("JOBQ_WORKFLOW_PREFIX", "acct/pref")

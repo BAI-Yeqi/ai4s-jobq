@@ -194,6 +194,26 @@ class WorkflowShellCommandProcessor(ShellCommandProcessor):
     ) -> int:
         from ai4s.jobq.workflow.entities import WorkflowCompletion
 
+        # Early-exit if the workflow was already cancelled before we start work.
+        persistence = await self._get_persistence()
+        if await persistence.get_cancel_requested(workflow_id):
+            LOG.info(
+                "Workflow %s already cancelled — skipping task %s (attempt=%s)",
+                workflow_id,
+                task_name,
+                attempt_no,
+            )
+            await self._publish_completion(
+                WorkflowCompletion(
+                    workflow_id=workflow_id,
+                    task_name=task_name,
+                    success=False,
+                    error="workflow cancelled",
+                    attempt_no=attempt_no,
+                )
+            )
+            return 0
+
         # Build subprocess env and per-task sidecar files.
         sub_env = self._prepare_workflow_env(env, workflow_id, task_name, attempt_no)
         upstream_refs_file = self._write_upstream_refs(sub_env, upstream_refs)

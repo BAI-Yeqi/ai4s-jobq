@@ -375,6 +375,39 @@ async def test_worker_cancellation_terminates_subprocess(
 
 
 @skip_without_azurite
+async def test_worker_skips_already_cancelled_workflow(
+    workflow_env: str,
+    submitted_workflow: tuple[str, str],
+    persistence: WorkflowPersistence,
+) -> None:
+    """A workflow cancelled before the task starts must publish a failed completion
+    immediately without launching the subprocess."""
+    from ai4s.jobq.workflow.worker import WorkflowShellCommandProcessor
+
+    wf_id, _ = submitted_workflow
+    await persistence.request_cancel(wf_id)
+
+    async with WorkflowShellCommandProcessor() as proc:
+        ret = await proc(
+            cmd="sleep 30",
+            _job_id="job-pre-cancel",
+            __workflow_id=wf_id,
+            __workflow_task="solo",
+            __attempt_no=1,
+            __upstream_output_refs={},
+        )
+
+    assert ret == 0
+
+    completions = await _drain_completion_queue(workflow_env)
+    assert len(completions) == 1
+    c = completions[0]
+    assert c.success is False
+    assert c.error == "workflow cancelled"
+    assert c.attempt_no == 1
+
+
+@skip_without_azurite
 async def test_lazy_workflow_context_resolves_upstreams(
     workflow_env: str,
     persistence: WorkflowPersistence,

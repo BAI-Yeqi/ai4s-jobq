@@ -212,8 +212,38 @@ def test_cancel_marks_pending_and_running_remains() -> None:
     assert rt.tasks["D"].state == TaskState.CANCELLED
     assert rt.tasks["A"].state == TaskState.RUNNING
 
+    # While A is still running, the workflow should be CANCELLING.
+    assert rt.workflow_state == WorkflowState.CANCELLING
+
     # Worker eventually completes A; workflow freezes as CANCELLED.
     rt.apply_completion("A", success=True)
+    assert rt.workflow_state == WorkflowState.CANCELLED
+
+
+def test_cancel_idempotent_path_recomputes_state() -> None:
+    """request_cancel() idempotent path must correct legacy RUNNING state."""
+    rt = WorkflowRuntime.from_definition("wf", _diamond())
+    rt.mark_dispatched(["A"])
+    # Simulate a state blob written before the CANCELLING state existed:
+    # cancel was applied but workflow_state was left as RUNNING.
+    rt.cancel_requested = True
+    rt.tasks["B"].state = TaskState.CANCELLED
+    rt.tasks["C"].state = TaskState.CANCELLED
+    rt.tasks["D"].state = TaskState.CANCELLED
+    rt.workflow_state = WorkflowState.RUNNING  # legacy value
+
+    # Calling request_cancel() again should recompute state to CANCELLING.
+    running = rt.request_cancel()
+    assert running == ["A"]
+    assert rt.workflow_state == WorkflowState.CANCELLING
+
+
+def test_cancel_all_pending_goes_directly_to_cancelled() -> None:
+    """When no tasks are RUNNING, cancel goes straight to CANCELLED."""
+    rt = WorkflowRuntime.from_definition("wf", _diamond())
+    # All tasks are still PENDING; no worker has started anything.
+    running = rt.request_cancel()
+    assert running == []
     assert rt.workflow_state == WorkflowState.CANCELLED
 
 

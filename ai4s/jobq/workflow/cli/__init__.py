@@ -847,13 +847,13 @@ async def workflow_cancel(ctx: click.Context, workflow_id: str, as_json: bool) -
             json.dumps(
                 {
                     "workflow_id": workflow_id,
-                    "cancelled": True,
+                    "cancel_requested": True,
                     "target": _format_target(ctx),
                 }
             )
         )
         return
-    click.echo(f"Cancelled workflow {workflow_id} in {_format_target(ctx)}.")
+    click.echo(f"Cancellation requested for workflow {workflow_id} in {_format_target(ctx)}.")
 
 
 @workflow_group.command("retry")

@@ -774,7 +774,12 @@ class Coordinator:
             return
         # Apply the cancel in-memory.  ``request_cancel`` is idempotent
         # so this is safe even if the flag was already applied.
+        old_state = runtime.workflow_state
         runtime.request_cancel()
+        if runtime.workflow_state == old_state:
+            # Cancel was already fully applied and state is stable
+            # (CANCELLING with workers still running); skip the flush.
+            return
         try:
             await self._persistence.flush(runtime, etag)
             self._runtime_cache.pop(workflow_id, None)

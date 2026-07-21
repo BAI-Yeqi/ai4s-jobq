@@ -102,6 +102,8 @@ class WorkflowState(str, Enum):
 
     PENDING = "pending"
     RUNNING = "running"
+    CANCELLING = "cancelling"
+    """Cancellation has been requested and applied; workers are still running."""
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -124,7 +126,9 @@ class WorkflowState(str, Enum):
 WorkflowState.TERMINAL = frozenset(
     {WorkflowState.COMPLETED, WorkflowState.FAILED, WorkflowState.CANCELLED}
 )
-WorkflowState.ACTIVE = frozenset({WorkflowState.PENDING, WorkflowState.RUNNING})
+WorkflowState.ACTIVE = frozenset(
+    {WorkflowState.PENDING, WorkflowState.RUNNING, WorkflowState.CANCELLING}
+)
 
 
 class DepPolicy(str, Enum):

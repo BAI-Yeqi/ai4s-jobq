@@ -515,6 +515,10 @@ class WorkflowRuntime:
             TaskState.READY_PENDING_BUDGET,
         )
         if self.cancel_requested and not any(t.state in cancellable for t in self.tasks.values()):
+            # Cancel was already fully applied (idempotent path).  Still
+            # recompute to ensure the state reflects CANCELLING vs CANCELLED
+            # correctly (e.g. after loading a legacy state blob).
+            self._recompute_workflow_state()
             return [n for n, t in self.tasks.items() if t.state == TaskState.RUNNING]
         self.cancel_requested = True
         ts = _utcnow()
@@ -711,6 +715,12 @@ class WorkflowRuntime:
             # Everything has settled after cancel; freeze as CANCELLED
             # so the UI distinguishes "cancelled" from natural failure.
             self.workflow_state = WorkflowState.CANCELLED
+            return
+
+        if self.cancel_requested and any_active:
+            # Cancel was applied but workers are still running; surface
+            # this intermediate state so the UI shows "cancelling".
+            self.workflow_state = WorkflowState.CANCELLING
             return
 
         if any_active:
