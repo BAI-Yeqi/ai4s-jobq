@@ -40,8 +40,7 @@ class ImageAssessmentGate:
                 raise
             message = "Install ai4s-jobq[scan] to enable worker image assessment."
             raise ModuleNotFoundError(message) from exc
-        assessor_kwargs.setdefault("scan_mode", "Artifacts")
-        return cls(scanner.ImageAssessor(**assessor_kwargs))
+        return cls(scanner.ImageAssessor.from_artifacts(**assessor_kwargs))
 
     def assess(self, image: str) -> _ScanVerdict:
         """Return a clean verdict or propagate the scanner's rejection/error."""
