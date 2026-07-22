@@ -59,6 +59,7 @@ def _bare_workforce(**overrides) -> Workforce:
     wf._aml_client.resource_group_name = "rg"
     wf._aml_client.workspace_name = "ws"
     wf._image_resolver = None
+    wf._denied_digests = set()
     wf._env_register_lock = threading.Lock()
     wf._registered_env_id_cache = {}
     for k, v in overrides.items():
