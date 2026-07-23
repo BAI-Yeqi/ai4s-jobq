@@ -235,6 +235,24 @@ class TestImageDenylistStore:
         with pytest.raises(ValueError, match="shutdown_mode"):
             await store.add(_DIGEST, shutdown_mode="nope")
 
+    async def test_add_duplicate_without_force_raises(self, store):
+        from ai4s.jobq.denylist import DenylistEntryExistsError
+
+        await store.add(_DIGEST, reason="first")
+        with pytest.raises(DenylistEntryExistsError):
+            await store.add(_DIGEST, reason="second")
+        # The original entry is untouched.
+        got = await store.get(_DIGEST)
+        assert got is not None
+        assert got.reason == "first"
+
+    async def test_add_duplicate_with_force_overwrites(self, store):
+        await store.add(_DIGEST, reason="first")
+        await store.add(_DIGEST, reason="second", force=True)
+        got = await store.get(_DIGEST)
+        assert got is not None
+        assert got.reason == "second"
+
 
 @skip_without_table
 class TestOpenInert:

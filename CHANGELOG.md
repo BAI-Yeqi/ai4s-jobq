@@ -1,6 +1,19 @@
 CHANGELOG
 =========
 
+3.17.0 (2026-07-23)
+-------------------
+
+Features:
+
+* **``denylist add`` no longer clobbers existing entries.** Adding a digest
+  that is already denied now fails instead of silently overwriting the
+  existing entry (which could weaken another operator's deny, for example one
+  with an immediate hard stop). Pass ``--force`` to overwrite deliberately.
+  The ``ImageDenylist.add`` API gains a ``force`` parameter (default
+  ``False``) and raises the new ``DenylistEntryExistsError`` when the digest is
+  already present.
+
 3.16.0 (2026-07-22)
 -------------------
 

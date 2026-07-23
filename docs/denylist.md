@@ -77,6 +77,9 @@ ai4s-jobq denylist add sha256:<hex> --shutdown-mode hard
 # enforced). Accepts an ISO date/datetime, or "now" (the default).
 ai4s-jobq denylist add sha256:<hex> --reason "CVE-1234" --effective 2026-07-29
 
+# Overwrite an existing entry (adding a duplicate fails without --force)
+ai4s-jobq denylist add sha256:<hex> --reason "updated" --force
+
 # Inspect the denylist
 ai4s-jobq denylist list
 ai4s-jobq denylist list --as-json
@@ -93,6 +96,11 @@ auto-derived from the caller's Azure AD token (`upn`, falling back to the
 object id); it stays blank when the store uses connection-string auth.
 Entries stay in effect until an operator removes them with
 `ai4s-jobq denylist remove`.
+
+`denylist add` refuses to overwrite an existing entry for the same digest: if
+the digest is already denied it fails, so one operator does not silently clobber
+an entry that someone else placed (for example, one with an immediate hard
+stop). Pass `--force` to overwrite an existing entry deliberately.
 
 `--effective` schedules when a deny takes effect. It defaults to `now`
 (effective immediately). An entry whose effective date is still in the future

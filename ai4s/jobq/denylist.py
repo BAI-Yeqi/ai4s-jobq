@@ -60,6 +60,15 @@ _DEFAULT_POLL_INTERVAL_S = 60
 VALID_SHUTDOWN_MODES = ("graceful", "hard")
 _DEFAULT_SHUTDOWN_MODE = "graceful"
 
+
+class DenylistEntryExistsError(Exception):
+    """Raised when adding a digest that is already denied without ``force``."""
+
+    def __init__(self, digest: str) -> None:
+        super().__init__(f"{digest} is already in the denylist; pass force=True to overwrite it")
+        self.digest = digest
+
+
 # Env-var and AML-job-tag keys carrying a worker's resolved image digests.
 # Injected by the workforce at hire time; read by the worker self-check and
 # by the workforce's denylist enforcement (via job tags).
@@ -374,14 +383,21 @@ class ImageDenylist:
         added_by: str = "",
         shutdown_mode: str = _DEFAULT_SHUTDOWN_MODE,
         effective_at: datetime | None = None,
+        force: bool = False,
     ) -> DenylistEntry:
-        """Add (or overwrite) a denied digest. Returns the stored entry.
+        """Add a denied digest. Returns the stored entry.
 
         ``effective_at`` schedules when the deny takes effect; when ``None``
         (the default) the entry is effective immediately. Entries whose
         effective date is still in the future are stored and listed but not
         enforced until that time arrives.
+
+        By default this refuses to clobber an existing entry: if the digest is
+        already denied, :class:`DenylistEntryExistsError` is raised. Pass
+        ``force=True`` to overwrite the existing entry.
         """
+        from azure.core.exceptions import ResourceExistsError
+
         mode = (shutdown_mode or _DEFAULT_SHUTDOWN_MODE).lower()
         if mode not in VALID_SHUTDOWN_MODES:
             raise ValueError(
@@ -395,12 +411,19 @@ class ImageDenylist:
             shutdown_mode=mode,
             effective_at=effective_at,
         )
-        await self._table.upsert_entity(entry._to_entity())
+        if force:
+            await self._table.upsert_entity(entry._to_entity())
+        else:
+            try:
+                await self._table.create_entity(entry._to_entity())
+            except ResourceExistsError:
+                raise DenylistEntryExistsError(entry.digest) from None
         LOG.info(
-            "denylist_add digest=%s mode=%s effective=%s reason=%s",
+            "denylist_add digest=%s mode=%s effective=%s force=%s reason=%s",
             entry.digest,
             mode,
             (effective_at.isoformat() if effective_at else "now"),
+            force,
             reason,
         )
         return entry

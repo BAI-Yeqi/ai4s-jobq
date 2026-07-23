@@ -91,6 +91,33 @@ class TestDenylistCli:
         res = await runner.invoke(denylist_group, ["add", _DIGEST, "--effective", "soon"])
         assert res.exit_code != 0
 
+    async def test_add_duplicate_without_force_fails(self, denylist_env):
+        runner = CliRunner()
+        res = await runner.invoke(denylist_group, ["add", _DIGEST, "--reason", "first"])
+        assert res.exit_code == 0, res.output
+
+        res = await runner.invoke(denylist_group, ["add", _DIGEST, "--reason", "second"])
+        assert res.exit_code != 0
+        assert "already" in res.output.lower()
+        assert "--force" in res.output
+
+        # Original entry preserved.
+        res = await runner.invoke(denylist_group, ["list"])
+        assert "first" in res.output
+        assert "second" not in res.output
+
+    async def test_add_duplicate_with_force_overwrites(self, denylist_env):
+        runner = CliRunner()
+        res = await runner.invoke(denylist_group, ["add", _DIGEST, "--reason", "first"])
+        assert res.exit_code == 0, res.output
+
+        res = await runner.invoke(denylist_group, ["add", _DIGEST, "--reason", "second", "--force"])
+        assert res.exit_code == 0, res.output
+
+        res = await runner.invoke(denylist_group, ["list"])
+        assert "second" in res.output
+        assert "first" not in res.output
+
     async def test_list_json_empty(self, denylist_env):
         runner = CliRunner()
         res = await runner.invoke(denylist_group, ["list", "--as-json"])

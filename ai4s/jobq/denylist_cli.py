@@ -119,10 +119,22 @@ def denylist_group() -> None:
     help="When the deny takes effect: an ISO date/datetime (e.g. 2026-07-29) or "
     "'now'. Until then the entry is listed but not enforced.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite an existing entry for this digest. Without it, adding an "
+    "already-denied digest fails.",
+)
 async def denylist_add(
-    sha: str, reason: str, added_by: str, shutdown_mode: str, effective: str
+    sha: str, reason: str, added_by: str, shutdown_mode: str, effective: str, force: bool
 ) -> None:
-    """Add (or overwrite) a denied image digest."""
+    """Add a denied image digest.
+
+    Fails if the digest is already denied unless ``--force`` is given.
+    """
+    from ai4s.jobq.denylist import DenylistEntryExistsError
+
     effective_at = _parse_effective(effective)
     try:
         normalize_digest(sha)
@@ -137,13 +149,17 @@ async def denylist_add(
             added_by = await caller_identity() or ""
     store = await _open_store()
     async with store:
-        entry = await store.add(
-            sha,
-            reason=reason,
-            added_by=added_by,
-            shutdown_mode=shutdown_mode,
-            effective_at=effective_at,
-        )
+        try:
+            entry = await store.add(
+                sha,
+                reason=reason,
+                added_by=added_by,
+                shutdown_mode=shutdown_mode,
+                effective_at=effective_at,
+                force=force,
+            )
+        except DenylistEntryExistsError as exc:
+            raise click.ClickException(f"{exc} (use --force to overwrite)") from exc
     click.echo(f"Added: {_fmt_entry(entry)}")
 
 
