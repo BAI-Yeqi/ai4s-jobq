@@ -152,6 +152,63 @@ class MultiRegionWorkforce:
         else:
             workforce.parallel_hire(n)
 
+    async def _enforce_denylist_across_regions(self) -> set[str]:
+        """Apply the image-SHA denylist across all regions (fail-open).
+
+        Opens the denylist store (inert when unconfigured), and for the set
+        of currently-denied digests:
+
+        - caches it on each :class:`Workforce` so subsequent hires for a
+          denied prototype image are refused, and
+        - cancels every active/pending worker whose recorded image digest
+          is denied.
+
+        Returns the denied-digest set (empty when the denylist is
+        unconfigured/unreachable). Never raises — a denylist outage must not
+        break a scaling tick.
+        """
+        from ai4s.jobq.denylist import ImageDenylist
+
+        denied: set[str] = set()
+        try:
+            store = await ImageDenylist.open()
+        except Exception as exc:
+            LOG.warning("denylist_open_failed error=%s; skipping enforcement this tick", exc)
+            store = None
+        if store is not None:
+            try:
+                async with store:
+                    denied = await store.denied_digests()
+            except Exception as exc:
+                LOG.warning("denylist_fetch_failed error=%s; skipping enforcement this tick", exc)
+                denied = set()
+
+        for wf in self.workforces:
+            wf.set_denied_digests(denied)
+        if not denied:
+            return denied
+
+        # Cancellation touches the AML MFE; run each region's enforcement in
+        # a worker thread so regions proceed concurrently without blocking
+        # the event loop.
+        def _enforce(wf: Workforce) -> int:
+            try:
+                return len(wf.enforce_denylist(denied))
+            except Exception as exc:  # pragma: no cover - fail-open
+                LOG.warning("denylist_enforce_failed experiment=%s error=%s", wf, exc)
+                return 0
+
+        results = await asyncio.gather(*(asyncio.to_thread(_enforce, wf) for wf in self.workforces))
+        total_cancelled = sum(results)
+        if total_cancelled:
+            LOG.warning(
+                "denylist_enforced queue=%s cancelled=%d worker(s) across %d region(s)",
+                self.queue_name,
+                total_cancelled,
+                len(self.workforces),
+            )
+        return denied
+
     @staticmethod
     def _fmt_uptime(seconds: float) -> str:
         s = int(seconds)
@@ -457,6 +514,15 @@ class MultiRegionWorkforce:
         )
         # Reset per-tick instrumentation; ``states`` cache gets rebuilt below.
         self._phase_durations = {}
+        self._states = None
+
+        # Enforce the image-SHA denylist before scaling: cancel denied
+        # workers and cache the denylist so hires refuse denied images.
+        # Fail-open — never let a denylist outage break scaling.
+        denylist_start = time.monotonic()
+        await self._enforce_denylist_across_regions()
+        self._phase_durations["denylist"] = time.monotonic() - denylist_start
+        # States may have changed as a result of denylist cancellations.
         self._states = None
 
         currently_running = sum([s.num_running for s in self.states])

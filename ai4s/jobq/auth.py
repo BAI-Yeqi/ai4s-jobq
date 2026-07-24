@@ -170,3 +170,52 @@ async def close_cached_credentials() -> None:
     obtained (via ``async with`` or ``await cred.close()``) instead.
     """
     return
+
+
+_STORAGE_SCOPE = "https://storage.azure.com/.default"
+
+
+def _decode_jwt_claims(token: str) -> dict[str, Any]:
+    """Best-effort decode of a JWT's payload claims (no signature check)."""
+    import base64
+    import json
+
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)  # restore base64 padding
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+async def caller_identity(scope: str = _STORAGE_SCOPE) -> str | None:
+    """Best-effort caller identity (UPN, else object id) from the AAD token.
+
+    Acquires a token from :func:`get_token_credential` and reads its
+    identity claims. Returns ``None`` when no credential is available (for
+    example a connection-string / Azurite context) or the token carries no
+    usable identity claim.
+    """
+    try:
+        credential = get_token_credential()
+        async with credential:
+            token = await credential.get_token(scope)
+        claims = _decode_jwt_claims(token.token)
+    except Exception as exc:
+        LOG.debug("could not derive caller identity: %s", exc)
+        return None
+    for key in ("upn", "preferred_username", "unique_name", "email"):
+        value = claims.get(key)
+        if value:
+            return str(value)
+    # Service principals / managed identities have no UPN — fall back to the
+    # object id (and appid as a last resort).
+    for key in ("oid", "appid"):
+        value = claims.get(key)
+        if value:
+            return str(value)
+    return None

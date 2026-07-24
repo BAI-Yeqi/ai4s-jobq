@@ -23,6 +23,7 @@ from azure.core.credentials_async import AsyncTokenCredential
 
 from ai4s.jobq import JobQ, __version__
 from ai4s.jobq.auth import get_token_credential
+from ai4s.jobq.denylist_cli import denylist_group
 from ai4s.jobq.entities import EmptyQueue, LockLostError, WorkerCanceled
 from ai4s.jobq.logging_utils import JobQRichHandler, setup_logging
 from ai4s.jobq.orchestration import WorkSpecification, batch_enqueue, get_results
@@ -59,7 +60,7 @@ class StorageQueueSpec(BackendSpec):
 
 
 # Commands that don't require a BACKEND_SPEC argument
-_NO_BACKEND_COMMANDS = {"copilot-skill", "workflow", "track"}
+_NO_BACKEND_COMMANDS = {"copilot-skill", "workflow", "track", "denylist"}
 
 
 class JobQGroup(click.Group):
@@ -937,6 +938,7 @@ def _install_copilot_skill():  # pragma: no cover
 
 
 main.add_command(skill_file_cmd)
+main.add_command(denylist_group)
 
 try:
     from ai4s.jobq.workflow.cli import workflow_group

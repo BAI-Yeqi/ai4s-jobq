@@ -31,10 +31,40 @@ LOG = logging.getLogger(__name__)
 
 _DEFAULT_TTL_SECONDS = 3600
 
+# Platform whose arch-specific child manifest we resolve out of a
+# multi-arch manifest list. AML/Singularity workers run linux/amd64.
+_TARGET_OS = "linux"
+_TARGET_ARCH = "amd64"
+
 
 @dataclass(frozen=True)
 class _CacheEntry:
     digest: str
+    resolved_at_monotonic: float
+
+
+@dataclass(frozen=True)
+class ImageDigests:
+    """Both digest forms for an image reference.
+
+    ``list_digest`` is the digest of the manifest the tag points at (the
+    multi-arch manifest-list digest for a multi-arch tag, or the single
+    manifest digest otherwise). ``arch_digest`` is the arch-specific child
+    manifest digest (``linux/amd64``) when the tag resolves to a manifest
+    list, else ``None``. Either form may appear on the denylist.
+    """
+
+    list_digest: str | None = None
+    arch_digest: str | None = None
+
+    def all(self) -> set[str]:
+        """The known digests (``sha256:…``), skipping unresolved ``None``s."""
+        return {d for d in (self.list_digest, self.arch_digest) if d}
+
+
+@dataclass(frozen=True)
+class _DigestsCacheEntry:
+    digests: ImageDigests
     resolved_at_monotonic: float
 
 
@@ -66,6 +96,7 @@ class ImageDigestResolver:
         self._ttl_seconds = ttl_seconds
         self._fail_open = fail_open
         self._cache: dict[str, _CacheEntry] = {}
+        self._digests_cache: dict[str, _DigestsCacheEntry] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -147,6 +178,99 @@ class ImageDigestResolver:
         if not digest.startswith("sha256:"):
             raise RuntimeError(f"unexpected digest format from ACR: {digest!r}")
         return digest
+
+    def resolve_digests(self, image_uri: str) -> ImageDigests:
+        """Resolve both the manifest-list and arch-specific child digests.
+
+        Unlike :meth:`resolve` (which rewrites the URI), this returns the
+        raw digests used for denylist tagging / matching. Behaviour:
+
+        - Already digest-pinned (``@sha256:``): returns that as
+          ``list_digest`` with no arch resolution.
+        - Non-ACR registry: returns an empty :class:`ImageDigests` (unknown).
+        - On any error with ``fail_open=True``: returns an empty
+          :class:`ImageDigests`; with ``fail_open=False`` re-raises.
+
+        Results are cached under the same TTL as :meth:`resolve`.
+        """
+        if "@sha256:" in image_uri:
+            return ImageDigests(list_digest=image_uri.split("@", 1)[1])
+
+        registry, repo, tag = _parse_image_uri(image_uri)
+
+        if not registry.endswith(".azurecr.io"):
+            LOG.warning(
+                "image_digests_skip image=%s reason=non-ACR registry; "
+                "only *.azurecr.io is supported for digest resolution",
+                image_uri,
+            )
+            return ImageDigests()
+
+        with self._lock:
+            entry = self._digests_cache.get(image_uri)
+            now = time.monotonic()
+            if entry is not None and (now - entry.resolved_at_monotonic) < self._ttl_seconds:
+                return entry.digests
+
+            try:
+                list_digest = self._fetch_digest(registry, repo, tag)
+                arch_digest = self._fetch_arch_digest(registry, repo, list_digest)
+            except Exception as exc:
+                LOG.warning(
+                    "image_digests_resolution_failed image=%s error=%s; returning empty digests%s",
+                    image_uri,
+                    exc,
+                    "" if self._fail_open else " (re-raising)",
+                )
+                if self._fail_open:
+                    return ImageDigests()
+                raise
+
+            digests = ImageDigests(list_digest=list_digest, arch_digest=arch_digest)
+            LOG.info(
+                "image_digests_resolved image=%s list=%s arch=%s",
+                image_uri,
+                list_digest,
+                arch_digest,
+            )
+            self._digests_cache[image_uri] = _DigestsCacheEntry(
+                digests=digests, resolved_at_monotonic=now
+            )
+            return digests
+
+    def _fetch_arch_digest(self, registry: str, repo: str, manifest_digest: str) -> str | None:
+        """Return the ``linux/amd64`` child digest of a manifest list.
+
+        Returns ``None`` when the manifest is a single (already
+        arch-specific) manifest rather than a multi-arch index, or when the
+        target platform is not present.
+        """
+        from azure.containerregistry import ContainerRegistryClient
+
+        endpoint = f"https://{registry}"
+        with ContainerRegistryClient(endpoint, self._credential) as client:
+            result = client.get_manifest(repo, manifest_digest)
+        manifest = getattr(result, "manifest", None)
+        if not isinstance(manifest, dict):
+            return None
+        children = manifest.get("manifests")
+        if not children:
+            # A plain single-arch manifest: its own digest is arch-specific.
+            return None
+        for child in children:
+            platform = child.get("platform") or {}
+            if platform.get("os") == _TARGET_OS and platform.get("architecture") == _TARGET_ARCH:
+                digest = child.get("digest")
+                if isinstance(digest, str) and digest.startswith("sha256:"):
+                    return digest
+        LOG.warning(
+            "image_arch_digest_missing repo=%s manifest=%s target=%s/%s",
+            repo,
+            manifest_digest,
+            _TARGET_OS,
+            _TARGET_ARCH,
+        )
+        return None
 
 
 def _parse_image_uri(image_uri: str) -> tuple[str, str, str]:

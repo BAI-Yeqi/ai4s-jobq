@@ -140,6 +140,7 @@ It is therefore *crucial* that you only use queues in storage accounts with tigh
 
    workflow.md
    monitoring.md
+   denylist.md
    api.md
    misc
 

@@ -34,6 +34,7 @@ from contextlib import AsyncExitStack, suppress
 from functools import wraps
 from itertools import chain
 
+from ai4s.jobq.denylist import denylist_shutdown_on_unreachable
 from ai4s.jobq.entities import EmptyQueue, LockLostError, Response, WorkerCanceled
 from ai4s.jobq.jobq import JobQ, JobQFuture
 from ai4s.jobq.logging_utils import (
@@ -302,6 +303,14 @@ async def launch_workers(
     """
     if worker_id is None:
         worker_id = uuid.uuid4().hex
+
+    # Fail-closed startup guard: on managed compute (Singularity) where the
+    # denylist is mandatory, refuse to start unless it is configured and
+    # reachable. No-op in the normal fail-open case.
+    from ai4s.jobq.denylist_monitor import assert_denylist_available
+
+    await assert_denylist_available()
+
     max_idle_backoff_s = max_idle_backoff.total_seconds() if max_idle_backoff else 30.0
     if max_idle_backoff_s < 1.0:
         # The exponential schedule starts at 2 s; capping below 1 s would
@@ -574,6 +583,47 @@ async def launch_workers(
         # This will look like a preemption to the process and
         # should give tasks the opportunity to checkpoint.
         asyncio.get_event_loop().call_later(time_limit.total_seconds(), timeout_shutdown)
+
+        # Worker-side image-SHA denylist self-check. When this worker's own
+        # image digest lands on the denylist, shut down using the severity
+        # from the matching row: ``graceful`` stops accepting new tasks and
+        # lets the current one finish; ``hard`` cancels it immediately.
+        from ai4s.jobq.denylist import DenylistEntry
+        from ai4s.jobq.denylist_monitor import DenylistEventHandler
+
+        def on_denied(entry: "DenylistEntry") -> None:
+            if entry.shutdown_mode == "hard":
+                shutdown_handler(
+                    hard=True,
+                    resume_if_not_killed=False,
+                    pass_signal_to_subprocess=True,
+                    signal=None,
+                )
+            else:
+                shutdown_handler(
+                    hard=False,
+                    resume_if_not_killed=False,
+                    pass_signal_to_subprocess=False,
+                    signal=None,
+                )
+
+        def on_unreachable() -> None:
+            # Fail-closed contexts only (opt-in): treat a persistently
+            # unreachable denylist like a graceful shutdown request.
+            shutdown_handler(
+                hard=False,
+                resume_if_not_killed=False,
+                pass_signal_to_subprocess=False,
+                signal=None,
+            )
+
+        await stack.enter_async_context(
+            DenylistEventHandler(
+                on_denied,
+                shutdown_on_unreachable=denylist_shutdown_on_unreachable(),
+                on_unreachable=on_unreachable,
+            )
+        )
 
         await stack.enter_async_context(
             workforce_monitor(worker_id=worker_id, queue_name=queue.full_name)

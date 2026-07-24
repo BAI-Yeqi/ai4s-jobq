@@ -8,6 +8,47 @@ Unreleased
   from linked cached evidence reach AzureML submission and receive the
   ``fedramp.scan-version`` property.
 
+3.17.0 (2026-07-23)
+-------------------
+
+Features:
+
+* **``denylist add`` no longer clobbers existing entries.** Adding a digest
+  that is already denied now fails instead of silently overwriting the
+  existing entry (which could weaken another operator's deny, for example one
+  with an immediate hard stop). Pass ``--force`` to overwrite deliberately.
+  The ``ImageDenylist.add`` API gains a ``force`` parameter (default
+  ``False``) and raises the new ``DenylistEntryExistsError`` when the digest is
+  already present.
+
+3.16.0 (2026-07-22)
+-------------------
+
+Features:
+
+* **Image-SHA denylist.** Operators can now stop and prevent jobq workers
+  from running a specific container image, identified by either its
+  multi-arch manifest digest or an arch-specific child digest. The denylist
+  is a shared Azure Table (org-wide by default, overridable). Each autoscale
+  tick the workforce cancels active or pending workers whose recorded image
+  digest is denied and refuses to hire for a denied prototype image; every
+  worker also self-checks its own ``JOBQ_IMAGE_DIGEST`` /
+  ``JOBQ_IMAGE_DIGEST_ARCH`` against the denylist and shuts down when denied
+  (``graceful`` or ``hard`` per entry). Manage entries with the new
+  ``ai4s-jobq denylist add/remove/list/check`` CLI. Entries may carry an
+  effective date (``denylist add --effective``, default now): a deny scheduled
+  in the future is listed but not enforced until its effective date arrives,
+  so operators can stage a deny ahead of a hard deadline. Configure via
+  ``JOBQ_DENYLIST_ACCOUNT`` / ``JOBQ_DENYLIST_TABLE`` /
+  ``JOBQ_DENYLIST_DISABLE`` / ``JOBQ_DENYLIST_POLL_INTERVAL_S``. The feature
+  is fail-open by default (a missing or unreachable store never cancels a
+  healthy worker), except on managed compute such as Singularity, where the
+  denylist is fail-closed: workers refuse to start without a reachable store
+  and shut down if it becomes persistently unreachable
+  (``JOBQ_DENYLIST_REQUIRE=0`` opts out). The store defaults to the shared
+  org-wide ``jobq0central`` account (override with ``JOBQ_DENYLIST_ACCOUNT``).
+  See the new "Image SHA denylist" documentation page.
+
 3.15.0 (2026-07-15)
 -------------------
 

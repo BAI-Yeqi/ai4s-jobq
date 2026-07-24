@@ -44,6 +44,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
+from typing import get_args as ty_get_args
+
+from ai4s.jobq.denylist import IMAGE_DIGEST_ARCH_ENV, IMAGE_DIGEST_ENV
 
 if TYPE_CHECKING:
     from ai4s.jobq.orchestration.image_assessment import ImageAssessmentGate
@@ -98,6 +101,9 @@ Status = Literal[
     "Validating",
     "Waiting",
 ]
+
+# Runtime-inspectable set of the ``Status`` literal members.
+_STATUS_VALUES: frozenset[str] = frozenset(ty_get_args(Status))
 
 
 class AmlComputeInfoPropertiesProperties(BaseModel):
@@ -170,6 +176,7 @@ class AmlJob(BaseModel):
     cluster: str
     error_msg: str | None = None
     metrics: dict[str, float]
+    tags: dict[str, str] = {}
 
     @property
     def url(self):
@@ -192,6 +199,27 @@ def azcli(cmd, decode_json=True):
             LOG.info("No AZURE_CLIENT_ID set, can not login with identity.")
             raise e
     return json.loads(out) if decode_json else out
+
+
+def _extract_job_tags(raw_job: dict) -> dict[str, str]:
+    """Pull user tags out of an AML index-API run entity.
+
+    The index response is not officially documented; tags have been seen
+    under ``annotations.tags`` and ``properties.tags`` depending on the
+    entity version. Merge whatever is present, tolerating absence, and
+    coerce keys/values to ``str``.
+    """
+    tags: dict[str, str] = {}
+    for container in (raw_job.get("properties"), raw_job.get("annotations")):
+        if not isinstance(container, dict):
+            continue
+        raw_tags = container.get("tags")
+        if isinstance(raw_tags, dict):
+            for key, value in raw_tags.items():
+                if value is None:
+                    continue
+                tags[str(key)] = str(value)
+    return tags
 
 
 class Workforce:
@@ -262,6 +290,9 @@ class Workforce:
         self.session = requests.Session()
         self._image_resolver = image_resolver
         self._image_assessment_gate = image_assessment_gate
+        # Denied image digests, refreshed by the orchestration tick. When a
+        # hire's prototype resolves to one of these, the hire is refused.
+        self._denied_digests: set[str] = set()
         self._env_register_lock = threading.Lock()
         self._registered_env_id_cache: dict[str, str] = {}
         t = self._credential.get_token("https://management.azure.com/.default")
@@ -280,6 +311,27 @@ class Workforce:
     def set_image_assessment_gate(self, gate: "ImageAssessmentGate | None") -> None:
         """Install (or clear) a submission gate after construction."""
         self._image_assessment_gate = gate
+
+    def set_denied_digests(self, denied: set[str]) -> None:
+        """Update the cached denylist consulted by :meth:`hire`.
+
+        Set by :class:`MultiRegionWorkforce` each autoscale tick so hires
+        are refused for a denied prototype image without the (sync)
+        ``Workforce`` needing to touch the async denylist store itself.
+        """
+        self._denied_digests = set(denied)
+
+    def _refuse_hire_if_denied(self) -> str | None:
+        """Return the denied digest blocking a hire, logging when it does."""
+        denied = self.prototype_denied_digest(self._denied_digests)
+        if denied is not None:
+            LOG.warning(
+                "denylist_hire_refused experiment=%s image_digest=%s; "
+                "not submitting workers for a denied image",
+                self._experiment_name,
+                denied,
+            )
+        return denied
 
     def _create_servicebus_resources(self):
         """
@@ -505,6 +557,7 @@ class Workforce:
                         if (metrics := raw_job["annotations"].get("metrics")) is not None
                         else {}
                     ),
+                    tags=_extract_job_tags(raw_job),
                 )
                 total_jobs_yielded += 1
 
@@ -650,7 +703,8 @@ class Workforce:
         job.name = f"{self._experiment_name}-{random_id}"
 
         env = job.environment
-        assessment_image = getattr(env, "image", None)
+        original_image = getattr(env, "image", None)
+        assessment_image = original_image
         resolved_env = None
         scanner_version = None
         if assessment_image and self._image_resolver is not None:
@@ -659,6 +713,7 @@ class Workforce:
                 resolved_env = copy.copy(env)
                 resolved_env.image = resolved
             assessment_image = resolved
+            self._inject_image_digests(job, original_image)
 
         if self._image_assessment_gate is not None:
             if not assessment_image:
@@ -681,6 +736,30 @@ class Workforce:
             job.properties["fedramp.scan-version"] = scanner_version
 
         return job
+
+    def _inject_image_digests(self, job: Command, image_uri: str) -> None:
+        """Record the worker's resolved image digest(s) on the job.
+
+        Both the multi-arch manifest-list digest and (when the tag is
+        multi-arch) the ``linux/amd64`` child digest are written as
+        environment variables (for the worker's own denylist self-check)
+        and as AML job tags (so the workforce can list and cancel workers
+        by digest). Missing/unresolvable digests are simply omitted.
+        """
+        if self._image_resolver is None:
+            return
+        try:
+            digests = self._image_resolver.resolve_digests(image_uri)
+        except Exception as exc:  # pragma: no cover - resolver is fail-open
+            LOG.warning("image_digest_inject_failed image=%s error=%s", image_uri, exc)
+            return
+        job.tags = dict(getattr(job, "tags", None) or {})
+        if digests.list_digest:
+            job.environment_variables[IMAGE_DIGEST_ENV] = digests.list_digest
+            job.tags[IMAGE_DIGEST_ENV] = digests.list_digest
+        if digests.arch_digest:
+            job.environment_variables[IMAGE_DIGEST_ARCH_ENV] = digests.arch_digest
+            job.tags[IMAGE_DIGEST_ARCH_ENV] = digests.arch_digest
 
     def _run_parallel(
         self,
@@ -795,6 +874,8 @@ class Workforce:
         prototype directly used to poison subsequent reads of
         ``self._job.compute`` (e.g. :meth:`get_compute_infos`).
         """
+        if self._refuse_hire_if_denied() is not None:
+            return
         for i in self._progress_iter(range(1, n + 1), desc="Hiring", total=n, enabled=progress):
             job = self._build_worker()
             LOG.debug(f"Creating worker {job.name}")
@@ -827,6 +908,8 @@ class Workforce:
             progress: Show a Rich progress bar (default True).
         """
         if n <= 0:
+            return
+        if self._refuse_hire_if_denied() is not None:
             return
         # First hire primes any code/environment upload so subsequent parallel
         # submissions reuse the cached artifact in blob storage.
@@ -954,6 +1037,103 @@ class Workforce:
                 )
             else:
                 raise e
+
+    # Statuses considered "still consuming (or about to consume) a slot"
+    # for denylist enforcement: any non-terminal state. A denied worker must
+    # be cancelled whether it is already running or merely queued.
+    _DENYLIST_ENFORCE_STATUSES: tuple[Status, ...] = (
+        "Not started",
+        "Paused",
+        "Preparing",
+        "Queued",
+        "Running",
+        "Starting",
+        "Waiting",
+    )
+
+    @staticmethod
+    def _worker_denied_digest(worker: AmlJob, denied: set[str]) -> str | None:
+        """Return the worker's denied image digest, or ``None``.
+
+        Checks both the manifest-list and arch-specific digest tags written
+        at hire time by :meth:`_inject_image_digests`.
+        """
+        for key in (IMAGE_DIGEST_ENV, IMAGE_DIGEST_ARCH_ENV):
+            digest = worker.tags.get(key)
+            if digest and digest in denied:
+                return digest
+        return None
+
+    def enforce_denylist(
+        self,
+        denied: set[str],
+        *,
+        workers: int = 8,
+        progress: bool = False,
+    ) -> list[AmlJob]:
+        """Cancel every active/pending worker whose image digest is denied.
+
+        Args:
+            denied: Canonical ``sha256:…`` digests currently on the denylist.
+            workers: Thread-pool size for concurrent cancellation.
+            progress: Show a Rich progress bar.
+
+        Returns:
+            The workers that were selected for cancellation. Empty when
+            ``denied`` is empty or nothing matched (no API writes then).
+        """
+        if not denied:
+            return []
+        valid = {s for s in self._DENYLIST_ENFORCE_STATUSES if s in _STATUS_VALUES}
+        candidates = [
+            job
+            for job in self.list_jobs(with_status=list(valid))
+            if self._worker_denied_digest(job, denied) is not None
+        ]
+        if not candidates:
+            return []
+        LOG.warning(
+            "denylist_enforce experiment=%s cancelling=%d workers on denied image(s)",
+            self._experiment_name,
+            len(candidates),
+        )
+        if len(candidates) == 1 or workers <= 1:
+            for worker in self._progress_iter(
+                candidates, desc="Denylist cancel", total=len(candidates), enabled=progress
+            ):
+                self._cancel_one(worker)
+        else:
+            self._run_parallel(
+                self._cancel_one,
+                candidates,
+                workers=workers,
+                progress=progress,
+                desc="Denylist cancel",
+                item_label=lambda w: w.name,
+            )
+        return candidates
+
+    def prototype_denied_digest(self, denied: set[str]) -> str | None:
+        """Return the prototype image's denied digest, or ``None``.
+
+        Used to refuse hiring workers for a denied image. Requires an image
+        resolver; without one (or on a resolver error) returns ``None``
+        (fail-open — the worker's own self-check remains the backstop).
+        """
+        if not denied or self._image_resolver is None:
+            return None
+        image = getattr(getattr(self._job, "environment", None), "image", None)
+        if not image:
+            return None
+        try:
+            digests = self._image_resolver.resolve_digests(image)
+        except Exception as exc:  # pragma: no cover - resolver is fail-open
+            LOG.warning("denylist_prototype_resolve_failed image=%s error=%s", image, exc)
+            return None
+        for digest in digests.all():
+            if digest in denied:
+                return digest
+        return None
 
     def lay_off(self, n: int, *, progress: bool = True) -> None:
         """Cancel ``n`` workers sequentially, preferring less-advanced jobs.
