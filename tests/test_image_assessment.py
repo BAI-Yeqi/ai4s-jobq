@@ -61,17 +61,22 @@ def test_missing_optional_dependency_has_install_hint(monkeypatch):
         ImageAssessmentGate.from_scanner()
 
 
-def test_scanner_factory_uses_artifact_consumer_profile(monkeypatch):
+def test_scanner_factory_forces_cache_only_auto_profile(monkeypatch):
     scanner = types.ModuleType("fedramp_scanner")
     scanner.ImageAssessor = MagicMock()  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "fedramp_scanner", scanner)
 
-    ImageAssessmentGate.from_scanner(severity="Critical")
-
-    scanner.ImageAssessor.from_artifacts.assert_called_once_with(  # type: ignore[attr-defined]
-        severity="Critical"
+    ImageAssessmentGate.from_scanner(
+        severity="Critical",
+        scan_mode="Defender",
+        cache_only=False,
     )
-    scanner.ImageAssessor.assert_not_called()  # type: ignore[attr-defined]
+
+    scanner.ImageAssessor.assert_called_once_with(  # type: ignore[attr-defined]
+        severity="Critical",
+        scan_mode="Auto",
+        cache_only=True,
+    )
 
 
 def test_lifecycle_logs_distinguish_clean_rejection_and_error(caplog):
