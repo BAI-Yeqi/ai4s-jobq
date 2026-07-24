@@ -703,13 +703,13 @@ class Workforce:
         job.name = f"{self._experiment_name}-{random_id}"
 
         env = job.environment
-        original_image = getattr(env, "image", None)
-        assessment_image = original_image
+        original_image: str | None = getattr(env, "image", None)
+        assessment_image: str | None = original_image
         resolved_env = None
         scanner_version = None
-        if assessment_image and self._image_resolver is not None:
-            resolved = self._image_resolver.resolve(assessment_image)
-            if resolved != assessment_image:
+        if original_image and self._image_resolver is not None:
+            resolved = self._image_resolver.resolve(original_image)
+            if resolved != original_image:
                 resolved_env = copy.copy(env)
                 resolved_env.image = resolved
             assessment_image = resolved
