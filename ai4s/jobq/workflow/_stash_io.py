@@ -46,7 +46,7 @@ async def _download_async(stash: BlobStash, target: Path) -> None:
         )
     from ai4s.jobq.workflow.context import _blob_service_client
 
-    md5 = hashlib.md5()  # noqa: S324 — md5 here is for integrity, not security
+    md5 = hashlib.md5(usedforsecurity=False)
     total = 0
     async with _blob_service_client(account) as svc:
         client = svc.get_container_client(container).get_blob_client(stash.blob_name)
@@ -85,7 +85,7 @@ async def _read_bytes_async(stash: BlobStash) -> bytes:
         data = await downloader.readall()
 
     if stash.md5:
-        actual = hashlib.md5(data).hexdigest()  # noqa: S324
+        actual = hashlib.md5(data, usedforsecurity=False).hexdigest()
         if actual != stash.md5:
             raise RuntimeError(
                 f"MD5 mismatch downloading {stash.blob_name}: expected {stash.md5}, got {actual}"

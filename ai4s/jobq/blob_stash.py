@@ -39,7 +39,7 @@ class BlobStasher:
         if filename is None:
             filename = f"{uuid.uuid4()}.pck"
         content = pickle.dumps(data)
-        md5sum = hashlib.md5(content).hexdigest()
+        md5sum = hashlib.md5(content, usedforsecurity=False).hexdigest()
         with self.blob_client:
             local_file_path = Path(self.blob_client.local_dir) / filename
             with open(local_file_path, "wb") as f:
@@ -89,7 +89,7 @@ class BlobStash(MSONable):
             self.blob_client.download_file(self.filename)
             with open(Path(self.blob_client.local_dir) / self.filename, "rb") as f:
                 content = f.read()
-                md5sum = hashlib.md5(content).hexdigest()
+                md5sum = hashlib.md5(content, usedforsecurity=False).hexdigest()
                 if expected_md5sum and md5sum != expected_md5sum:
                     raise RuntimeError(
                         f"The md5 hash ({md5sum}) of {self.blob_storage_uri}/{self.filename} does not match the expected md5 hash ({expected_md5sum})!"
