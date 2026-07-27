@@ -87,7 +87,7 @@ async def blob_container(clean_workflow_env: None):
 
 
 def _md5(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()  # noqa: S324 — integrity check in tests
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
 
 
 def _stash_marker(obj: dict) -> dict:

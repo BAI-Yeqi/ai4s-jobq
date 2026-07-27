@@ -364,7 +364,7 @@ class BlobContainer(_AbstractAsyncContextManager["BlobContainer"]):
         if filename is None:
             filename = f"{uuid.uuid4()}.pck"
         content = pickle.dumps(data)
-        md5sum = hashlib.md5(content).hexdigest()
+        md5sum = hashlib.md5(content, usedforsecurity=False).hexdigest()
         data = io.BytesIO(content)
         data.seek(0)
         await self.client.upload_blob(filename, data, overwrite=True)
@@ -381,7 +381,7 @@ class BlobContainer(_AbstractAsyncContextManager["BlobContainer"]):
         expected_md5sum = md5sum
         stream = await self.client.download_blob(filename)
         content = await stream.readall()
-        md5sum = hashlib.md5(content).hexdigest()
+        md5sum = hashlib.md5(content, usedforsecurity=False).hexdigest()
         if expected_md5sum and md5sum != expected_md5sum:
             raise RuntimeError(
                 f"The md5 hash ({md5sum}) of {filename} does not match the expected md5 hash ({expected_md5sum})!"
@@ -404,7 +404,7 @@ class BlobContainer(_AbstractAsyncContextManager["BlobContainer"]):
         if filename is None:
             filename = f"{uuid.uuid4()}.json"
         content = json.dumps(data).encode()
-        md5sum = hashlib.md5(content).hexdigest()
+        md5sum = hashlib.md5(content, usedforsecurity=False).hexdigest()
         await self.client.upload_blob(filename, io.BytesIO(content), overwrite=True)
         return BlobStash(
             blob_name=filename,
@@ -421,7 +421,7 @@ class BlobContainer(_AbstractAsyncContextManager["BlobContainer"]):
         stream = await self.client.download_blob(filename)
         content = await stream.readall()
         if md5sum:
-            actual = hashlib.md5(content).hexdigest()
+            actual = hashlib.md5(content, usedforsecurity=False).hexdigest()
             if actual != md5sum:
                 raise RuntimeError(
                     f"The md5 hash ({actual}) of {filename} does not match "
