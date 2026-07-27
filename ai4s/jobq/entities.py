@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+import hashlib
 import json
 import os
 import uuid
 from dataclasses import dataclass, field
-import hashlib
 from typing import Any
 
 if os.getenv("JOBQ_USE_MONTY_JSON", "").lower() in ("1", "true", "yes"):
