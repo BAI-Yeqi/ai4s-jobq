@@ -160,8 +160,8 @@ async def run_cmd_and_log_outputs(
                 "true",
                 "yes",
             ):
-                # use a login shell, so that the user's .bashrc is sourced
-                # and conda activate works out of the box.
+                # use a login shell, so that the user's shell startup files
+                # (bashrc etc.) are sourced and conda activate works out of the box.
                 # This is not the default anymore and only kept for backwards compatibility.
                 # Using login shells messes with Singularity's environment, where
                 # login shells `cd` into a specific directory and print a banner.

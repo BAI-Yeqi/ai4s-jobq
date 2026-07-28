@@ -589,7 +589,7 @@ class TestConditionValidate:
     def test_disallowed_import(self):
         """Verify that validate_condition rejects import-based expressions."""
         with pytest.raises(ValueError, match="Only aggregate functions"):
-            validate_condition("__import__('os').system('rm -rf /')", ["A"])
+            validate_condition("__import__('os').system('echo pwned')", ["A"])
 
     def test_unknown_variable(self):
         """Verify that validate_condition rejects unknown variable names."""
