@@ -101,7 +101,6 @@ jobs:
         export TWINE_PASSWORD
         python3 -m twine upload \
           --repository-url "$FEED_UPLOAD_URL" \
-          --skip-existing \
           --non-interactive \
           --verbose \
           dist/*

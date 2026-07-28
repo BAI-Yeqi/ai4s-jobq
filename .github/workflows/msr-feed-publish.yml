@@ -46,20 +46,22 @@ jobs:
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
       with:
         python-version: "3.x"
-    - name: Rename distribution for the MSR shared feed
-      # The shared feed requires the `msresearch-` prefix. Rewrite only the
-      # distribution name; the import package and console script are unchanged.
-      run: |
-        set -euo pipefail
-        sed -i 's/^name = "ai4s-jobq"$/name = "msresearch-ai4s-jobq"/' pyproject.toml
-        grep -q '^name = "msresearch-ai4s-jobq"$' pyproject.toml \
-          || { echo "ERROR: distribution rename failed"; exit 1; }
     - name: Install pypa/build
       run: python3 -m pip install build --user
     - name: Install package and doc dependencies for skill build
       run: pip install -e .[dev]
     - name: Build Copilot skill data
       run: python scripts/build_skill.py
+    - name: Rename distribution for the MSR shared feed
+      # The shared feed requires the `msresearch-` prefix. Rewrite only the
+      # distribution name; the import package and console script are unchanged.
+      # Must run after the skill build so that `importlib.metadata` still finds
+      # the original `ai4s-jobq` metadata during that step.
+      run: |
+        set -euo pipefail
+        sed -i 's/^name = "ai4s-jobq"$/name = "msresearch-ai4s-jobq"/' pyproject.toml
+        grep -q '^name = "msresearch-ai4s-jobq"$' pyproject.toml \
+          || { echo "ERROR: distribution rename failed"; exit 1; }
     - name: Build a binary wheel and a source tarball
       run: python3 -m build
     - name: Store the distribution packages
