@@ -51,6 +51,30 @@ exp_name = "my-first-workforce"
 workforce = Workforce(exp_name, task, credential=credential, aml_client=aml_client)
 ```
 
+### Cached image assessment
+
+Install `ai4s-jobq[workforce,scan]`, then combine strict digest resolution with
+the cache-only Auto assessment gate:
+
+```python
+from ai4s.jobq.orchestration.image_assessment import ImageAssessmentGate
+from ai4s.jobq.orchestration.image_resolver import ImageDigestResolver
+
+image_resolver = ImageDigestResolver(credential=credential, fail_open=False)
+image_assessment_gate = ImageAssessmentGate.from_scanner(credential=credential)
+workforce = Workforce(
+    exp_name, task, credential=credential, aml_client=aml_client,
+    image_resolver=image_resolver,
+    image_assessment_gate=image_assessment_gate,
+)
+```
+
+Only clean digest-pinned images are submitted and stamped with
+`fedramp.scan-version`; all other verdicts and errors abort submission. Pass the
+same objects to `MultiRegionWorkforce` to share their caches and lock. The gate
+requires exactly linked cached scan and FedRAMP evidence; it never uses live
+scanner backends or registry writes.
+
 To then start 3 jobs which execute the task:
 
 ```python

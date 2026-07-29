@@ -1,6 +1,13 @@
 CHANGELOG
 =========
 
+Unreleased
+----------
+
+* Add an optional strict cache-only worker-image gate. Only clean assessments
+  from linked cached evidence reach AzureML submission and receive the
+  ``fedramp.scan-version`` property.
+
 3.17.1 (2026-07-27)
 -------------------
 
