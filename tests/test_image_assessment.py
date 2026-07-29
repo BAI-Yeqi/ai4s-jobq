@@ -16,7 +16,7 @@ from ai4s.jobq.orchestration.image_assessment import ImageAssessmentGate
 class _Verdict:
     def __init__(self, status: str = "clean"):
         self.status = status
-        self.scanner_version = "1.1.0"
+        self.scanner_version = "1.1.0.post1"
 
     def raise_for_job(self) -> None:
         if self.status != "clean":

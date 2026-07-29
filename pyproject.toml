@@ -58,7 +58,7 @@ workforce = [
     "azure-ai-ml", "pydantic", "azure-containerregistry",
 ]
 scan = [
-  "msresearch-fedramp-scanner>=1.1,<2",
+  "msresearch-fedramp-scanner==1.1.0.post1",
 ]
 track = [
   "dash_bootstrap_components",

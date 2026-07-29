@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+import hashlib
 import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from hashlib import md5
 from typing import Any
 
 if os.getenv("JOBQ_USE_MONTY_JSON", "").lower() in ("1", "true", "yes"):
@@ -100,7 +100,10 @@ class Task:
     def _id(self):
         if self.id:
             return self.id
-        return md5(json.dumps(self._dict_without_id(), cls=JSON_ENCODER).encode()).hexdigest()
+        return hashlib.md5(
+            json.dumps(self._dict_without_id(), cls=JSON_ENCODER).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
 
     def _dict_without_id(self):
         return {

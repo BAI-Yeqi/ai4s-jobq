@@ -620,7 +620,7 @@ def _md5_and_size(path: str) -> tuple[str, int]:
     """Stream *path* once to compute its md5 and byte size."""
     import hashlib
 
-    h = hashlib.md5()  # noqa: S324 — integrity check, not security
+    h = hashlib.md5(usedforsecurity=False)
     size = 0
     with open(path, "rb") as fh:
         while True:

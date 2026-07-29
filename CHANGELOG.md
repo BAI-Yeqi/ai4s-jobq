@@ -8,6 +8,16 @@ Unreleased
   from linked cached evidence reach AzureML submission and receive the
   ``fedramp.scan-version`` property.
 
+3.17.1 (2026-07-27)
+-------------------
+
+Fixes:
+
+* **FIPS compatibility for non-security md5 usage.** All internal md5 hash
+  computations used for deterministic task IDs and blob integrity checks now
+  pass ``usedforsecurity=False`` to ``hashlib.md5`` so JobQ works in FIPS
+  environments without changing ID/digest behavior.
+
 3.17.0 (2026-07-23)
 -------------------
 
