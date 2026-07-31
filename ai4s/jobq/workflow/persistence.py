@@ -54,7 +54,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 from azure.core import MatchConditions
 from azure.core.exceptions import (
@@ -79,6 +79,8 @@ from ai4s.jobq.workflow.ids import (
 from ai4s.jobq.workflow.state import WorkflowRuntime
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
     from azure.data.tables.aio import TableClient, TableServiceClient
     from azure.storage.blob.aio import BlobClient, BlobServiceClient, ContainerClient
 
@@ -640,14 +642,27 @@ class WorkflowPersistence:
     # ------------------------------------------------------------------
 
     async def list_workflows(
-        self, *, status_filter: Iterable[WorkflowState | str] | None = None
+        self,
+        *,
+        status: WorkflowState | str | None = None,
+        status_filter: Iterable[WorkflowState | str] | None = None,
+        limit: int | None = None,
+        updated_after: datetime | None = None,
     ) -> list[WorkflowIndexRow]:
-        """Return all workflows, optionally filtered by state.
+        """Return workflows, optionally filtered by state, time, and limited.
 
         Pure index scan — does not load state blobs.
+
+        Args:
+            status: Filter by a single status (convenience alias for status_filter).
+            status_filter: Filter by multiple statuses. Ignored if status is given.
+            limit: Max number of workflows to return. None = no limit.
+            updated_after: Only return workflows updated after this datetime.
         """
         wanted: set[str] | None = None
-        if status_filter is not None:
+        if status is not None:
+            wanted = {str(status)}
+        elif status_filter is not None:
             wanted = {str(s) for s in status_filter}
 
         rows: list[WorkflowIndexRow] = []
@@ -655,7 +670,11 @@ class WorkflowPersistence:
             row = _entity_to_row(entity)
             if wanted is not None and str(row.workflow_state) not in wanted:
                 continue
+            if updated_after is not None and row.updated_at < updated_after:
+                continue
             rows.append(row)
+            if limit is not None and len(rows) >= limit:
+                break
         return rows
 
     async def get_index_row(self, workflow_id: str) -> WorkflowIndexRow | None:
@@ -909,6 +928,31 @@ class WorkflowPersistence:
         counters = runtime.reset_failed_tasks()
         await self.flush(runtime, etag)
         return counters
+
+    async def count_active_workflows_by_status(
+        self,
+        *,
+        on_progress: Callable[[dict[str, int]], None] | None = None,
+    ) -> dict[str, int]:
+        """Count active (non-terminal) workflows grouped by state.
+
+        Performs a single pass over the index table, calling *on_progress*
+        with a running snapshot after each entity so callers can update the
+        dashboard incrementally while the scan is in flight.
+
+        Returns:
+            dict mapping state name -> count for active (non-terminal) states.
+        """
+        counts: dict[str, int] = {}
+        async for entity in self._index_table.list_entities(
+            select=["workflow_state"],
+        ):
+            state = entity.get("workflow_state", "pending")
+            if not WorkflowState.is_terminal(state):
+                counts[state] = counts.get(state, 0) + 1
+                if on_progress is not None:
+                    on_progress(dict(counts))
+        return counts
 
     async def summary(self) -> dict[str, Any]:
         """Aggregate counts across all index rows."""

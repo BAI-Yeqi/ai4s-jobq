@@ -38,8 +38,9 @@ def _parse_queue_spec(queue_name: str, default_account: str) -> tuple[str, str]:
     if queue_name.startswith("sb://"):
         if "/" in queue_name[len("sb://") :]:
             # Format: sb://namespace/queue-name
-            parts = queue_name.split("/", 2)  # Split on first two /
-            return (f"sb://{parts[2]}", parts[3] if len(parts) > 3 else parts[2])
+            # Need to split on 3 slashes to separate "sb:", "", "namespace", "queue-name"
+            parts = queue_name.split("/", 3)
+            return (f"sb://{parts[2]}", parts[3] if len(parts) > 3 else "")
         # Just sb://namespace, use as account
         return (queue_name, "")
 

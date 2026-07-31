@@ -8,7 +8,7 @@ import logging
 import math
 import random
 from collections import deque
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import dash_bootstrap_components as dbc
@@ -120,14 +120,14 @@ def _task_duration_seconds(task: TaskStatus) -> float | None:
     if task.started_at is None or task.completed_at is None:
         return None
     start = (
-        task.started_at.astimezone(UTC)
+        task.started_at.astimezone(timezone.utc)
         if task.started_at.tzinfo
-        else task.started_at.replace(tzinfo=UTC)
+        else task.started_at.replace(tzinfo=timezone.utc)
     )
     end = (
-        task.completed_at.astimezone(UTC)
+        task.completed_at.astimezone(timezone.utc)
         if task.completed_at.tzinfo
-        else task.completed_at.replace(tzinfo=UTC)
+        else task.completed_at.replace(tzinfo=timezone.utc)
     )
     return max((end - start).total_seconds(), 0.0)
 
@@ -150,8 +150,8 @@ def _normalize_ts(ts: datetime | None) -> datetime | None:
     if ts is None:
         return None
     if ts.tzinfo is None:
-        return ts.replace(tzinfo=UTC)
-    return ts.astimezone(UTC)
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def layout() -> html.Div:
@@ -1013,6 +1013,7 @@ def _stylesheet() -> list[dict]:
                 "text-max-width": "80px",
                 "text-wrap": "ellipsis",
                 "min-zoomed-font-size": 8,
+                "grabbable": False,
             },
         },
         # Running nodes pulse larger

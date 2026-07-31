@@ -4,6 +4,11 @@ CHANGELOG
 Unreleased
 ----------
 
+* **Improve workflow visualization and local previews.** The Track dashboard
+  adds workflow progress bars, throughput and duration statistics, and improved
+  graph rendering. Local JSON/YAML definitions can now be opened directly with
+  ``ai4s-jobq workflow track --workflow-file PATH`` without submission or the
+  legacy top-level ``track`` command.
 * Add an optional strict cache-only worker-image gate. Only clean assessments
   from linked cached evidence reach AzureML submission and receive the
   ``fedramp.scan-version`` property.

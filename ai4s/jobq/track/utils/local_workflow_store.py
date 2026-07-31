@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,8 +39,8 @@ class LocalWorkflowStore:
         definition = _load_definition_for_preview(workflow_path)
         definition.validate()
 
-        now = datetime.now(UTC)
-        mtime = datetime.fromtimestamp(workflow_path.stat().st_mtime, tz=UTC)
+        now = datetime.now(timezone.utc)
+        mtime = datetime.fromtimestamp(workflow_path.stat().st_mtime, tz=timezone.utc)
         created_at = min(now, mtime)
         updated_at = max(now, mtime)
 

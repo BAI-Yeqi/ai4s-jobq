@@ -1456,10 +1456,23 @@ async def workflow_purge(
 
 @workflow_group.command("track")
 @click.option("--port", "-p", "port", default=8050, type=int, help="Port to run the dashboard on.")
+@click.option(
+    "--workflow-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    envvar="JOBQ_WORKFLOW_FILE",
+    default=None,
+    help="Visualize a local workflow JSON/YAML file without submitting it.",
+)
 @click.option("--no-open", is_flag=True, help="Don't auto-open a browser window.")
 @click.option("--debug", is_flag=True, help="Enable debug logging.")
 @click.pass_context
-async def workflow_track(ctx: click.Context, debug: bool, port: int, no_open: bool) -> None:
+async def workflow_track(
+    ctx: click.Context,
+    debug: bool,
+    port: int,
+    workflow_file: str | None,
+    no_open: bool,
+) -> None:
     """Launch the workflow monitoring dashboard.
 
     Opens a browser-based Dash app showing workflow health, status,
@@ -1470,6 +1483,7 @@ async def workflow_track(ctx: click.Context, debug: bool, port: int, no_open: bo
     Examples:
         ai4s-jobq workflow myaccount/MyProject track
         JOBQ_WORKFLOW_PREFIX=myaccount/MyProject ai4s-jobq workflow track
+        ai4s-jobq workflow track --workflow-file workflow.json
     """
     import os
 
@@ -1485,7 +1499,10 @@ async def workflow_track(ctx: click.Context, debug: bool, port: int, no_open: bo
 
     storage = ctx.obj.get("storage", "")
     prefix = ctx.obj.get("prefix", "")
-    if storage and prefix:
+    if workflow_file:
+        os.environ["JOBQ_WORKFLOW_FILE"] = workflow_file
+        os.environ.pop("JOBQ_WORKFLOW_PREFIX", None)
+    elif storage and prefix:
         os.environ["JOBQ_WORKFLOW_PREFIX"] = f"{storage}/{prefix}"
 
     from ai4s.jobq.track.app import run_with_default_queue

@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import socket
 import sys
 import uuid
@@ -70,6 +71,7 @@ skip_without_azurite = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def clean_workflow_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
+        "JOBQ_WORKFLOW_FILE",
         "JOBQ_WORKFLOW_PREFIX",
         "JOBQ_WORKFLOW_QUEUES",
         "JOBQ_WORKFLOW_BLOBS",
@@ -103,6 +105,32 @@ async def _invoke_workflow(*args: str):
         list(args),
         catch_exceptions=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_track_accepts_local_workflow_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    workflow = tmp_path / "workflow.json"
+    workflow.write_text('{"name": "preview", "tasks": []}')
+    called: dict[str, object] = {}
+
+    def _run_with_default_queue(*, debug: bool, port: int, open_browser: bool) -> None:
+        called.update(debug=debug, port=port, open_browser=open_browser)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ai4s.jobq.track.app",
+        SimpleNamespace(run_with_default_queue=_run_with_default_queue),
+    )
+    monkeypatch.setenv("JOBQ_WORKFLOW_PREFIX", "account/prefix")
+
+    result = await _invoke_workflow(
+        "track", "--workflow-file", str(workflow), "-p", "8765", "--no-open"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called == {"debug": False, "port": 8765, "open_browser": False}
+    assert os.environ["JOBQ_WORKFLOW_FILE"] == str(workflow)
+    assert "JOBQ_WORKFLOW_PREFIX" not in os.environ
 
 
 def _context(storage: str | None = "acct", prefix: str | None = "pref") -> click.Context:
