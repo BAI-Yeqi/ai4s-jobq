@@ -4,6 +4,13 @@ CHANGELOG
 Unreleased
 ----------
 
+* The workflow coordinator now handles Ctrl-C and SIGTERM as graceful
+  shutdown requests, finishing its in-flight batch and releasing its lease
+  before exiting.
+
+3.18.0 (2026-08-20)
+-------------------
+
 * **Improve workflow visualization and local previews.** The Track dashboard
   adds workflow progress bars, throughput and duration statistics, and improved
   graph rendering. Local JSON/YAML definitions can now be opened directly with

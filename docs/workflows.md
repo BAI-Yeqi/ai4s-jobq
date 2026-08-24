@@ -699,6 +699,10 @@ and advances workflows:
 ai4s-jobq workflow coordinator
 ```
 
+Press Ctrl-C or send SIGTERM to stop the coordinator cleanly. It finishes
+processing any in-flight completion batch, closes its queue clients, and
+releases the coordinator lease before exiting.
+
 It can be restarted at any time—all state lives in the runtime-state
 blobs. Completion messages are durable on the completion queue, so
 nothing is lost during downtime. Run **exactly one** coordinator

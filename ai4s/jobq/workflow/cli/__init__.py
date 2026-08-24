@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING
+import signal
+from contextlib import ExitStack, contextmanager
+from typing import TYPE_CHECKING, Protocol
 
 import asyncclick as click
 
@@ -34,6 +36,9 @@ from ai4s.jobq.workflow.entities import TaskState, WorkflowState
 __all__ = ["workflow_group"]
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from types import FrameType
+
     from rich.text import Text
 
     from ai4s.jobq.workflow.client import SubmitResult, WorkflowClient
@@ -44,6 +49,40 @@ LOG = logging.getLogger("ai4s.jobq")
 # Register subcommand modules (side-effect imports).
 import ai4s.jobq.workflow.cli._doctor  # noqa: E402
 import ai4s.jobq.workflow.cli._explain  # noqa: E402, F401
+
+
+class _CoordinatorStopper(Protocol):
+    def stop(self) -> None: ...
+
+
+@contextmanager
+def _coordinator_signal_handlers(coord: _CoordinatorStopper) -> Iterator[None]:
+    """Translate process termination signals into a graceful coordinator stop."""
+    loop = asyncio.get_running_loop()
+    shutdown_requested = False
+
+    def request_shutdown(received_signal: signal.Signals) -> None:
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        click.echo(
+            f"\nReceived {received_signal.name}; shutting down coordinator…",
+            err=True,
+        )
+        coord.stop()
+
+    def handle_signal(signum: int, _frame: FrameType | None) -> None:
+        loop.call_soon_threadsafe(request_shutdown, signal.Signals(signum))
+
+    with ExitStack() as stack:
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous_handler = signal.signal(shutdown_signal, handle_signal)
+            except (OSError, ValueError):
+                continue
+            stack.callback(signal.signal, shutdown_signal, previous_handler)
+        yield
 
 
 @workflow_group.command("submit")
@@ -1160,11 +1199,12 @@ async def workflow_coordinator(
         running_timeout_s=effective_running_timeout,
         running_sweep_interval_s=effective_running_sweep,
     ) as coord:
-        try:
-            await coord.run()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            click.echo("\nShutting down coordinator…", err=True)
-            coord.stop()
+        with _coordinator_signal_handlers(coord):
+            try:
+                await coord.run()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                click.echo("\nShutting down coordinator…", err=True)
+                coord.stop()
         stats = coord.stats
         click.echo(
             f"Coordinator stopped — "

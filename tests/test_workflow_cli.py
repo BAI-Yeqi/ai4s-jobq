@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import uuid
@@ -1347,6 +1349,47 @@ async def test_workflow_coordinator_renders_banner_and_runs(
     assert "Starting workflow coordinator…" in result.stderr, (
         "startup message should appear in stderr"
     )
+
+
+@pytest.mark.parametrize("shutdown_signal", [signal.SIGINT, signal.SIGTERM])
+async def test_workflow_coordinator_signal_requests_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    shutdown_signal: signal.Signals,
+) -> None:
+    """SIGINT and SIGTERM request a graceful stop and restore the prior handlers."""
+    installed: dict[signal.Signals, object] = {}
+    restored: dict[signal.Signals, object] = {}
+    previous_handlers = {
+        signal.SIGINT: object(),
+        signal.SIGTERM: object(),
+    }
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        if sig in installed:
+            restored[sig] = handler
+        else:
+            installed[sig] = handler
+        return previous_handlers[sig]
+
+    class FakeCoordinator:
+        stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    monkeypatch.setattr(workflow_cli.signal, "signal", fake_signal)
+    coord = FakeCoordinator()
+
+    with workflow_cli._coordinator_signal_handlers(coord):
+        handler = installed[shutdown_signal]
+        assert callable(handler)
+        handler(shutdown_signal, None)
+        await asyncio.sleep(0)
+        assert coord.stop_calls == 1
+
+    assert restored == previous_handlers
+    assert f"Received {shutdown_signal.name}; shutting down coordinator…" in capsys.readouterr().err
 
 
 async def test_workflow_coordinator_rejects_service_bus_backend(
