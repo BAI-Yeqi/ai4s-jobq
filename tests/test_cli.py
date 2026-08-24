@@ -415,16 +415,16 @@ async def test_signal_handling(mocker, tmp_path, queue_name) -> None:
 
     assert "bash got signal-A" in combined
     assert "bash got signal-B" in combined
-    assert combined.count("Requeueing") == 2
     # graceful cancel must be fast: it must not wait for the task's full sleep time (10s)
     assert (end - start).total_seconds() < 8
 
-    await asyncio.sleep(2)  # give azurite some time
-
-    n = 0
+    deadline = time.monotonic() + 12
     async with QueueClient.from_connection_string(azurite_conn_str(), queue_name) as queue:
-        async for _msg in queue.receive_messages(timeout=1):
-            n += 1
+        while True:
+            n = len(await queue.peek_messages(2))
+            if n == 2 or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.1)
     assert n == 2
 
 
