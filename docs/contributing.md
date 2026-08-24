@@ -1,4 +1,4 @@
-# Contributions
+# Contributing
 
 This project welcomes contributions and suggestions. Most contributions require you to
 agree to a Contributor License Agreement (CLA) declaring that you have the right to,
@@ -13,23 +13,44 @@ This project has adopted the [Microsoft Open Source Code of Conduct](https://ope
 For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/)
 or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
 
-## Installing Development Dependencies
+## Install development dependencies
 
 ```bash
 pip install -e '.[dev]'
+npm install
 ```
 
-## Running Unit Tests
+## Run tests
+
+Tests use Azurite to emulate Azure Blob Storage and Azure Queue Storage. Start both
+services before running the test suite:
 
 ```bash
-pip install tox tox-conda
-tox -e py310
+./node_modules/.bin/azurite-blob \
+  --skipApiVersionCheck --inMemoryPersistence --disableTelemetry --blobPort 10000 &
+./node_modules/.bin/azurite-queue \
+  --skipApiVersionCheck --inMemoryPersistence --disableTelemetry --queuePort 10001 &
+pytest
 ```
 
-## Releasing
+CI runs the test suite directly with `pytest` on Python 3.10, 3.11, and 3.12. The
+repository still contains a `tox.ini` configuration for running the same version
+matrix locally, but tox is not used in CI or required for the standard development
+workflow.
 
-To release docs, run `make release-docs` in the root directory of the repository.
-Make sure you have write permissions on the `gh-pages` branch.
+## Release
 
-We're currently working on releasing the package to an (internal or public)
-package index.
+Releases are managed by maintainers through GitHub Actions:
+
+1. Update `CHANGELOG.md` with the version and release date, then merge the change
+   after CI passes.
+2. Create and push a tag named `v<version>`. The version is derived from the tag by
+   `setuptools-scm`.
+3. The tag triggers the workflows that build the distributions and publish them to
+   the configured Azure Artifacts feeds.
+
+The TestPyPI workflow can be run manually to validate a distribution before release.
+Publishing to public PyPI is disabled in this repository.
+
+Documentation is built and deployed to GitHub Pages automatically after changes are
+merged to `main`; no `gh-pages` branch or manual `make release-docs` step is required.
