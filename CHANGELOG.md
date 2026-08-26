@@ -12,6 +12,8 @@ Unreleased
   before exiting.
 * Update the optional worker-image assessment dependency to
   ``msresearch-fedramp-scanner==1.2.0``.
+* Treat a missing image-denylist table as unavailable so required managed
+  workers fail closed instead of treating it as an empty denylist.
 
 3.18.0 (2026-08-20)
 -------------------

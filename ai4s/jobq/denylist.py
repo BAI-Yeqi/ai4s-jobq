@@ -129,6 +129,11 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt
 
 
+def _is_table_not_found(exc: Exception) -> bool:
+    """Whether an Azure Table not-found error refers to the table itself."""
+    return getattr(exc, "error_code", None) == "TableNotFound" or "TableNotFound" in str(exc)
+
+
 # ── entry model ───────────────────────────────────────────────────────────────
 
 
@@ -456,7 +461,9 @@ class ImageDenylist:
 
         try:
             entity = await self._table.get_entity(_PARTITION_KEY, _row_key(digest))
-        except ResourceNotFoundError:
+        except ResourceNotFoundError as exc:
+            if _is_table_not_found(exc):
+                raise
             return None
         return DenylistEntry._from_entity(dict(entity))
 

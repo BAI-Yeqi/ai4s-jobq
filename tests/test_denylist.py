@@ -11,8 +11,10 @@ from __future__ import annotations
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from azure.core.exceptions import ResourceNotFoundError
 
 from ai4s.jobq.denylist import (
     DenylistEntry,
@@ -157,6 +159,26 @@ class TestDenylistEntry:
         assert past.is_effective(now) is True
         future = DenylistEntry(digest=_DIGEST, effective_at=now + timedelta(days=1))
         assert future.is_effective(now) is False
+
+
+class TestImageDenylistNotFound:
+    @staticmethod
+    def _store_with_error(error_code: str) -> ImageDenylist:
+        store = ImageDenylist.__new__(ImageDenylist)
+        store._table = MagicMock()
+        error = ResourceNotFoundError(error_code)
+        error.error_code = error_code
+        store._table.get_entity = AsyncMock(side_effect=error)
+        return store
+
+    async def test_missing_entity_returns_none(self):
+        store = self._store_with_error("ResourceNotFound")
+        assert await store.get(_DIGEST) is None
+
+    async def test_missing_table_propagates(self):
+        store = self._store_with_error("TableNotFound")
+        with pytest.raises(ResourceNotFoundError):
+            await store.get(_DIGEST)
 
 
 # ── ImageDenylist against Azurite ─────────────────────────────────────────────
