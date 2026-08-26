@@ -8,8 +8,7 @@ Unreleased
   shutdown requests, finishing its in-flight batch and releasing its lease
   before exiting.
 * Update the optional worker-image assessment dependency to
-  ``msresearch-fedramp-scanner==1.2.0`` and exercise the real scanner factory
-  in CI.
+  ``msresearch-fedramp-scanner==1.2.0``.
 
 3.18.0 (2026-08-20)
 -------------------

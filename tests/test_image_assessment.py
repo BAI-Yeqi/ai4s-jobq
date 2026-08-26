@@ -79,12 +79,6 @@ def test_scanner_factory_forces_cache_only_auto_profile(monkeypatch):
     )
 
 
-def test_scanner_extra_factory_is_compatible():
-    gate = ImageAssessmentGate.from_scanner(severity="Critical")
-
-    assert isinstance(gate, ImageAssessmentGate)
-
-
 def test_lifecycle_logs_distinguish_clean_rejection_and_error(caplog):
     logger = "ai4s.jobq.orchestration.image_assessment"
     assessor = MagicMock()

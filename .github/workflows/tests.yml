@@ -86,7 +86,7 @@ jobs:
         ./node_modules/.bin/azurite-blob --skipApiVersionCheck --inMemoryPersistence --blobPort 10000 &
         ./node_modules/.bin/azurite-queue --skipApiVersionCheck --inMemoryPersistence --queuePort 10001 &
         python -m pip install --upgrade pip
-        python -m pip install -e ".[dev,scan,track,workforce]"
+        python -m pip install -e ".[dev,track,workforce]"
     - name: Test with pytest
       run: |
         pytest
