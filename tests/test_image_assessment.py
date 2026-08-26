@@ -16,7 +16,7 @@ from ai4s.jobq.orchestration.image_assessment import ImageAssessmentGate
 class _Verdict:
     def __init__(self, status: str = "clean"):
         self.status = status
-        self.scanner_version = "1.1.0.post1"
+        self.scanner_version = "1.2.0"
 
     def raise_for_job(self) -> None:
         if self.status != "clean":
@@ -77,6 +77,12 @@ def test_scanner_factory_forces_cache_only_auto_profile(monkeypatch):
         scan_mode="Auto",
         cache_only=True,
     )
+
+
+def test_scanner_extra_factory_is_compatible():
+    gate = ImageAssessmentGate.from_scanner(severity="Critical")
+
+    assert isinstance(gate, ImageAssessmentGate)
 
 
 def test_lifecycle_logs_distinguish_clean_rejection_and_error(caplog):
