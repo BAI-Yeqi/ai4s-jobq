@@ -44,6 +44,19 @@ default account (`jobq0central`) is the shared org-wide store; override
 `JOBQ_DENYLIST_ACCOUNT` to point at your own, or set `JOBQ_DENYLIST_DISABLE=1`
 to turn the feature off entirely.
 
+### Provisioning and permissions
+
+Provision the configured table before enabling required mode. A missing table
+is treated as an unavailable denylist, not as an empty denylist.
+
+- Schedulers and workers need the **Storage Table Data Reader** role.
+- Operators that add, update, or remove entries need the
+  **Storage Table Data Contributor** role.
+
+The client attempts to create the table when its identity has permission. A
+runtime identity with read-only access cannot create it, so deployments should
+provision the table once with an operator identity before launching workers.
+
 ### Fail-closed hardening
 
 On managed compute where an undeniable worker is unacceptable (detected via
