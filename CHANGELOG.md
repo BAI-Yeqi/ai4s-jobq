@@ -4,6 +4,9 @@ CHANGELOG
 Unreleased
 ----------
 
+3.18.1 (2026-08-26)
+-------------------
+
 * The workflow coordinator now handles Ctrl-C and SIGTERM as graceful
   shutdown requests, finishing its in-flight batch and releasing its lease
   before exiting.
